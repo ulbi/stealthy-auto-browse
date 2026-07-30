@@ -1,9 +1,9 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.psyb0t/stealthy-auto-browse",
+  "name": "io.github.ulbi/stealthy-auto-browse",
   "title": "Stealthy Auto Browse",
   "description": "Self-hosted MCP server for stealth browser automation with human-like OS-level input.",
-  "version": "2.1.0",
-  "repository": { "url": "https://github.com/psyb0t/docker-stealthy-auto-browse", "source": "github" },
-  "packages": [ { "registryType": "oci", "identifier": "docker.io/psyb0t/stealthy-auto-browse:latest", "runtimeHint": "docker", "transport": { "type": "streamable-http", "url": "http://localhost:8080/mcp" } } ]
+  "version": "3.0.0",
+  "repository": { "url": "https://github.com/ulbi/stealthy-auto-browse", "source": "github" },
+  "packages": [ { "registryType": "oci", "identifier": "ghcr.io/ulbi/stealthy-auto-browse:latest", "runtimeHint": "docker", "transport": { "type": "streamable-http", "url": "http://localhost:8080/mcp" } } ]
 }

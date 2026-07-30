@@ -1,6 +1,6 @@
 # Third-Party Software
 
-stealthy-auto-browse's own code (this repo) is [WTFPL](LICENSE)-licensed. The
+stealthy-auto-browse's own code (this repo) is [MIT](LICENSE)-licensed. The
 **published Docker image**, however, bakes in a browser and browser extensions
 at build time (`Dockerfile`: `RUN python -m camoufox fetch` and
 `RUN python /scripts/install_extensions.py`) that ship under their own licenses.

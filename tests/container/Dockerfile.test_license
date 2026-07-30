@@ -1,0 +1,9 @@
+FROM alpine:3.20
+
+RUN apk add --no-cache grep
+
+COPY test_license.sh /test_license.sh
+RUN chmod +x /test_license.sh
+
+# License file wird per Volume gemountet
+ENTRYPOINT ["/test_license.sh"]

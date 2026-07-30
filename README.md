@@ -266,4 +266,4 @@ Why it works: [docs/stealth.md](docs/stealth.md)
 
 ## License
 
-**WTFPL** — Do What The Fuck You Want To Public License
+**MIT** — See [LICENSE](LICENSE)
