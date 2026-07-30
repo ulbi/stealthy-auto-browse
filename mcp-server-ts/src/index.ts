@@ -1,5 +1,5 @@
-import crypto from 'node:crypto'
-globalThis.crypto = crypto as any
+// Node.js 24+ hat crypto als global – kein Polyfill nötig
+// Node.js 18 brauchte: globalThis.crypto = require('node:crypto')
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js'
