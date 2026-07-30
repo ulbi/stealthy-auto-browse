@@ -132,6 +132,17 @@ fi
 SESSION_PID=$!
 PIDS+=("$SESSION_PID")
 
+TS_MCP_PORT="${TS_MCP_PORT:-8081}"
+
+# Start TypeScript MCP server (if built)
+if [ -f /app/mcp-server-ts/dist/index.js ]; then
+    if [ "$SCRIPT_MODE" = "false" ]; then
+        node /app/mcp-server-ts/dist/index.js &
+        TS_PID=$!
+        PIDS+=("$TS_PID")
+    fi
+fi
+
 if [ "$SCRIPT_MODE" = "false" ]; then
     # Wait for API to be ready
     for ((attempt = 0; attempt < 30; attempt += 1)); do
@@ -144,17 +155,20 @@ if [ "$SCRIPT_MODE" = "false" ]; then
     # Banner
     echo ""
     echo "=============================================="
-    echo "  STEALTHY AUTO-BROWSE"
+    echo "  STEALTHY AUTO-BROWSE + TS MCP"
     echo "=============================================="
     echo ""
-    echo "  VNC:  http://${VNC_LISTEN_HOST}:${VNC_LISTEN_PORT}/"
-    echo "  API:  http://${HTTP_LISTEN_HOST}:${HTTP_LISTEN_PORT}"
+    echo "  VNC:     http://${VNC_LISTEN_HOST}:${VNC_LISTEN_PORT}/"
+    echo "  API:     http://${HTTP_LISTEN_HOST}:${HTTP_LISTEN_PORT}"
+    echo "  MCP (Py): http://${HTTP_LISTEN_HOST}:${HTTP_LISTEN_PORT}/mcp"
+    if [ -f /app/mcp-server-ts/dist/index.js ]; then
+        echo "  MCP (TS): http://${HTTP_LISTEN_HOST}:${TS_MCP_PORT}/mcp/ts"
+    fi
     echo ""
     echo "  Ctrl+C to exit"
     echo "=============================================="
     echo ""
 fi
 
-# Wait for main.py to exit and preserve its exit code
-wait $SESSION_PID
-EXIT_CODE=$?
+# Wait for processes to exit
+wait

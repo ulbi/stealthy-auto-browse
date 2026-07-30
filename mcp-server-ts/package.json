@@ -1,0 +1,28 @@
+{
+  "name": "@ulbi/stealthy-auto-browse-mcp-ts",
+  "version": "3.0.0",
+  "type": "module",
+  "description": "TypeScript MCP server wrapper for stealthy-auto-browse Python HTTP API",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:contract": "vitest run tests/contract",
+    "test:container": "cd tests/container && docker compose -f docker-compose.test.yml up --build --abort-on-container-exit test-runner"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.0.12",
+    "@modelcontextprotocol/sdk": "^1.17.0",
+    "hono": "^4.12.32",
+    "zod": "^3.24.0",
+    "zod-to-json-schema": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}

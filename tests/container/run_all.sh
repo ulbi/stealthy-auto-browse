@@ -9,21 +9,24 @@ echo "========================================"
 echo "  Stealthy Auto Browse - Container Tests"
 echo "========================================"
 
-for test_script in "$SCRIPT_DIR"/test_*.sh; do
-  test_name="$(basename "$test_script")"
-  echo ""
-  echo "--- Running: $test_name ---"
+find_tests() {
+  local search_dir="$1"
+  find "$search_dir" -name 'test_*.sh' -type f
+}
 
-  # Look for a corresponding Dockerfile
+for test_script in $(find_tests "$SCRIPT_DIR") $(find_tests "$REPO_DIR" -path '*/tests/container/test_*.sh'); do
+  test_name="$(basename "$test_script")"
+  test_dir="$(dirname "$test_script")"
   test_base="${test_name%.sh}"
-  dockerfile="$SCRIPT_DIR/Dockerfile.$test_base"
+  dockerfile="$test_dir/Dockerfile.$test_base"
+
+  echo ""
+  echo "--- Running: $test_name ($(realpath --relative-to=$REPO_DIR $test_script)) ---"
 
   if [ -f "$dockerfile" ]; then
-    # Build test image
     docker build -t "stealth-test-$test_base" \
-      -f "$dockerfile" "$SCRIPT_DIR" > /dev/null 2>&1
+      -f "$dockerfile" "$test_dir" > /dev/null 2>&1
 
-    # Run test with repo mounted
     if docker run --rm -v "$REPO_DIR:/repo:ro" "stealth-test-$test_base"; then
       echo "  ✅ $test_name PASSED"
     else
@@ -31,7 +34,7 @@ for test_script in "$SCRIPT_DIR"/test_*.sh; do
       FAILED=1
     fi
   else
-    echo "  ⚠️  No Dockerfile.$test_base found, skipping"
+    echo "  ⚠️  No Dockerfile.$test_base found at $dockerfile, skipping"
   fi
 done
 

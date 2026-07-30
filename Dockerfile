@@ -1,3 +1,18 @@
+# ============================================================
+# Stage 1: TypeScript MCP Server Build
+# ============================================================
+FROM node:22-alpine AS ts-builder
+WORKDIR /build
+COPY mcp-server-ts/package*.json ./
+RUN npm ci
+COPY mcp-server-ts/tsconfig.json ./
+COPY mcp-server-ts/src/ ./src/
+RUN npm run build
+RUN npm prune --production
+
+# ============================================================
+# Stage 2: Main Python Image
+# ============================================================
 # Base image pinned by digest — tags are mutable, digests aren't. Re-resolve
 # with: docker buildx imagetools inspect python:3.12-slim-bookworm --format '{{.Manifest.Digest}}'
 FROM python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b
@@ -39,7 +54,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # noVNC auto-connect redirect
 RUN echo '<!DOCTYPE html><html><head><meta http-equiv="refresh" content="0;url=vnc.html?autoconnect=true&resize=scale"></head></html>' > /usr/share/novnc/index.html
 
-# Firefox/Camoufox dependencies - install firefox-esr to pull correct GTK deps for any arch
+# Firefox/Camoufox dependencies
 RUN apt-get update \
     && apt-get install -y --no-install-recommends firefox-esr fonts-liberation \
     && apt-get remove -y --purge firefox-esr \
@@ -55,24 +70,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Node.js for TS MCP server
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install Python packages (system-level, needs root).
-#
-# camoufox is pinned to 0.4.11 ON PURPOSE. Leaving it unpinned pulled whatever
-# was newest at build time — camoufox 0.5.x reshaped the browser's on-disk
-# `distribution/` layout (no default `policies.json`), which broke
-# install_extensions.py mid-build (FileNotFoundError). Pinning locks the browser
-# build + layout the rest of this image is designed around (Firefox 135).
-#
-# Playwright is pinned to 1.53.0 to MATCH camoufox 0.4.11. camoufox 0.4.11
-# declares an UNPINNED `playwright` dependency, so a fresh `pip install` pulls
-# whatever is newest — and Playwright >= 1.60 crashes camoufox's custom Firefox
-# 135 build on protocol events (uncaught page errors with no location, WebSocket
-# asserts, etc.) because the driver's juggler expectations no longer match. See
-# daijro/camoufox#617 and microsoft/playwright#39767. Pinning to the last
-# pre-1.60 release the camoufox 0.4.11 / Firefox 135 juggler was built against
-# fixes the whole class of crashes at the source (vs. patching each failing
-# assert). Bump camoufox and playwright IN LOCKSTEP, and re-verify
-# install_extensions.py against the new browser layout.
 RUN pip install --no-cache-dir \
     "camoufox[geoip]==0.4.11" \
     "playwright==1.53.0" \
@@ -88,15 +91,20 @@ RUN chown -R browser:browser /usr/local/lib/python3.12/site-packages/camoufox/
 # Switch to non-root user for camoufox fetch + extensions
 USER browser
 
-# Download Camoufox browser (writes to ~/.cache/camoufox + GeoIP db to site-packages)
+# Download Camoufox browser
 RUN python -m camoufox fetch
 
-# Copy scripts and install extensions (writes to ~/.cache/camoufox)
+# Copy scripts and install extensions
 COPY --chown=browser:browser scripts/ /scripts/
 RUN python /scripts/install_extensions.py
 
 # Copy app
 COPY --chown=browser:browser app/ /app/
+
+# Copy TypeScript MCP server build
+COPY --chown=browser:browser mcp-server-ts/ /app/mcp-server-ts/
+COPY --from=ts-builder /build/dist /app/mcp-server-ts/dist
+COPY --from=ts-builder /build/node_modules /app/mcp-server-ts/node_modules
 
 # Set working directory
 WORKDIR /app
@@ -113,8 +121,9 @@ COPY --chmod=755 entrypoint.sh /entrypoint.sh
 # Environment variables
 ENV XVFB_RESOLUTION=1920x1080
 ENV XVFB_DEPTH=24
+ENV TS_MCP_PORT=8081
 
-# Expose ports (VNC and session HTTP)
-EXPOSE 5900 8080
+# Expose ports
+EXPOSE 5900 8080 8081
 
 ENTRYPOINT ["/entrypoint.sh"]

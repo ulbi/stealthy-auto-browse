@@ -1,0 +1,11 @@
+FROM node:22-alpine
+
+RUN mkdir -p /app
+WORKDIR /app
+
+# Source wird per Volume gemountet
+ENTRYPOINT ["sh", "-c", "\
+  cp -r /repo/mcp-server-ts/* /app/ && \
+  npm install && \
+  npx vitest run tests/contract \
+"]
