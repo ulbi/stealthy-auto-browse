@@ -1,3 +1,6 @@
+import crypto from 'node:crypto'
+globalThis.crypto = crypto as any
+
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js'
 import { Hono } from 'hono'
@@ -7,6 +10,7 @@ import { z } from 'zod'
 import { callPythonApi } from './client.js'
 
 const PORT = parseInt(process.env.PORT || '8081', 10)
+const LOG_PREFIX = '[TS-MCP]'
 
 function createServer(): McpServer {
   const server = new McpServer({
@@ -284,6 +288,26 @@ async function proxyTool(action: string, params: Record<string, unknown>): Promi
 // ==================== HTTP SERVER ====================
 
 const app = new Hono()
+
+// Request logging
+app.use('*', async (c, next) => {
+  const start = Date.now()
+  const method = c.req.method
+  const path = c.req.path
+  const body = await c.req.text().catch(() => '(no body)')
+  const truncated = body.length > 200 ? body.substring(0, 200) + '...' : body
+  console.log(`${LOG_PREFIX} --> ${method} ${path} ${truncated}`)
+  await next()
+  const ms = Date.now() - start
+  const status = c.res.status
+  console.log(`${LOG_PREFIX} <-- ${method} ${path} ${status} ${ms}ms`)
+})
+
+// Error handler
+app.onError((err, c) => {
+  console.error(`${LOG_PREFIX} ERROR: ${err.message}\n${err.stack}`)
+  return c.json({ error: err.message }, 500)
+})
 
 app.use('*', cors({
   origin: '*',
