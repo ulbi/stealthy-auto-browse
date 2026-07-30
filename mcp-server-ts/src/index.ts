@@ -289,14 +289,12 @@ async function proxyTool(action: string, params: Record<string, unknown>): Promi
 
 const app = new Hono()
 
-// Request logging
+// Request logging (NICHT c.req.text() lesen — das konsumiert den Body!)
 app.use('*', async (c, next) => {
   const start = Date.now()
   const method = c.req.method
   const path = c.req.path
-  const body = await c.req.text().catch(() => '(no body)')
-  const truncated = body.length > 200 ? body.substring(0, 200) + '...' : body
-  console.log(`${LOG_PREFIX} --> ${method} ${path} ${truncated}`)
+  console.log(`${LOG_PREFIX} --> ${method} ${path}`)
   await next()
   const ms = Date.now() - start
   const status = c.res.status
