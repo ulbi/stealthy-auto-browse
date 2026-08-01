@@ -66,7 +66,7 @@ Recommended defaults: bind to `127.0.0.1`, set `AUTH_TOKEN` to a strong random v
 
 All commands: `POST $STEALTHY_AUTO_BROWSE_URL/` with JSON body `{"action": "name", ...params}`.
 
-**`AUTH_TOKEN` is required for any non-localhost deployment.** When set, include it on every request (except `/health`):
+**`AUTH_TOKEN` is required for any non-localhost deployment.** When set, include it on every request (except `/health` and `GET /`):
 
 ```
 Authorization: Bearer <key>
