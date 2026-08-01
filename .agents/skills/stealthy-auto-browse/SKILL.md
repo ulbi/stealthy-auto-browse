@@ -194,7 +194,9 @@ For structured extraction, use `get_element` for one matching node or `get_eleme
 
 ### Virtual Camera and Microphone
 
-For authorized camera/microphone compatibility tests, mount test media at `/media` and configure `VIRTUAL_CAMERA_FILE` and/or `VIRTUAL_MICROPHONE_FILE` before the browser starts. A page's `navigator.mediaDevices.getUserMedia()` call then receives tracks captured from those files. A request for an unconfigured kind fails with `NotFoundError` rather than falling back to hardware. This virtualizes streams only; it does not add native devices to `enumerateDevices()`. Source files must remain within `VIRTUAL_MEDIA_DIR` (default `/media`) and the browser must restart after changes. See [references/setup.md](references/setup.md).
+For authorized camera/microphone compatibility tests, mount test media at `/media` and configure `VIRTUAL_CAMERA_FILE` and/or `VIRTUAL_MICROPHONE_FILE` before the browser starts. A page's `navigator.mediaDevices.getUserMedia()` call then receives tracks captured from those files. A request for an unconfigured kind fails with `NotFoundError` rather than falling back to hardware. This virtualizes streams only; it does not add native devices to `enumerateDevices()`. Source files must remain within `VIRTUAL_MEDIA_DIR` (default `/media`) and the browser must restart after static-source changes.
+
+Set `VIRTUAL_MEDIA_DYNAMIC=true` to switch file-backed sources at runtime. `set_virtual_media_source` takes `kind` (`"camera"` or `"microphone"`) plus an existing relative `source` name; `upload_virtual_media` takes `kind`, a safe `filename` whose declared media type matches that kind, strict base64 `content_base64`, and optional `activate`. The filename supplies only the extension: the service generates and returns a collision-safe stored basename and never overwrites a named source. It checks decoded uploads with `ffprobe` for the requested video or audio stream before storage or activation. Uploads are limited to `VIRTUAL_MEDIA_UPLOAD_MAX_BYTES` (50 MiB by default) and need a writable `VIRTUAL_MEDIA_DIR`. Already acquired page streams retain their track identities after a source switch. Only files inside the configured media directory are accepted—never arbitrary paths, remote URLs, WebSocket streams, or other live ingress. These actions require the same Bearer authorization as every other action when `AUTH_TOKEN` is set. See [references/setup.md](references/setup.md).
 
 ### Screenshots
 
@@ -464,6 +466,7 @@ steps:
 - **`output_id`** on any step collects its result into `outputs`. Screenshots become base64 data URIs.
 - **`${env.VAR_NAME}`** substitutes environment variables.
 - **`on_error: continue`** keeps going past failures. `stop` (default) halts.
+- **Control flow:** `if` conditions can inspect elements, text, URL globs, JavaScript booleans, and prior outputs. `repeat` and `while` require explicit bounds (1–100 iterations); a `while` that remains true at its bound fails visibly. See the [control-flow reference](https://github.com/psyb0t/docker-stealthy-auto-browse/blob/main/docs/script-mode.md#control-flow) for the complete schema and limits.
 - **All HTTP API actions** work as script steps.
 - **Logs go to stderr**, stdout is clean JSON.
 - **Exit code** 0 on success, 1 on failure.

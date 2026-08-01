@@ -1,6 +1,6 @@
 {
   "name": "stealthy-auto-browse",
-  "version": "2.1.0",
+  "version": "2.3.0",
   "description": "Headless-detection-resistant browser automation in Docker — Camoufox stealth browser, OS-level input via PyAutoGUI, HTTP API and MCP server, for authorized QA and defensive security testing.",
   "author": { "name": "ulbi", "url": "https://github.com/ulbi" },
   "homepage": "https://github.com/ulbi/stealthy-auto-browse",

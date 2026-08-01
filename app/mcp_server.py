@@ -113,7 +113,12 @@ async def run_script(
     load-balanced cluster.
 
     Each step is a dict with "action" and its parameters. Add "output_id" to
-    any step to collect its result in the response outputs dict.
+    any action step to collect its result in the response outputs dict. Steps
+    can also use control nodes: {"if": {"condition": ..., "then": [...]}}
+    selects a branch; {"repeat": {"count": 1, "steps": [...]}} repeats a
+    bounded body; and {"while": {"condition": ..., "max_iterations": 1,
+    "steps": [...]}} runs only within its explicit bound. Conditions support
+    element, text, URL-glob, JavaScript-boolean, and prior-output checks.
 
     steps example: [{"action": "goto", "url": "https://example.com",
     "wait_until": "networkidle"}, {"action": "get_text", "output_id":
@@ -149,8 +154,18 @@ async def run_script(
             - properties (list[str]): Up to 50 CSS property names. Defaults to display,
               visibility, color, and background-color.
         get_virtual_media_state: Report whether configured virtual camera and microphone
-            sources are active for getUserMedia().
+            sources are active for getUserMedia(), plus dynamic-source state.
             No parameters.
+        set_virtual_media_source: In opt-in dynamic-media mode, select an existing
+            contained file for future and already-acquired virtual tracks.
+            - kind (str, required): "camera" or "microphone".
+            - source (str, required): Safe relative file path below VIRTUAL_MEDIA_DIR.
+        upload_virtual_media: In opt-in dynamic-media mode, store a bounded base64
+            audio or video file under VIRTUAL_MEDIA_DIR and optionally activate it.
+            - kind (str, required): "camera" or "microphone".
+            - filename (str, required): Safe basename for the stored file.
+            - content_base64 (str, required): Strict base64 media bytes.
+            - activate (bool): Activate the uploaded source. Default false.
         get_interactive_elements: Find all interactive elements (buttons, links, inputs).
             - visible_only (bool): Only viewport-visible elements. Default true.
             Returns: list of elements with x, y, width, height, text, selector.
@@ -534,6 +549,8 @@ if not _cluster_mode:
         storage (get_storage, set_storage, clear_storage),
         dialogs (handle_dialog, get_last_dialog),
         downloads (get_last_download, upload_file),
+        virtual media (get_virtual_media_state, set_virtual_media_source,
+        upload_virtual_media),
         network logging (enable_network_log, get_network_log, etc.),
         console logging (enable_console_log, get_console_log, etc.),
         display (calibrate, get_resolution, enter_fullscreen, exit_fullscreen),
