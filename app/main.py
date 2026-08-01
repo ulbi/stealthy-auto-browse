@@ -11,6 +11,7 @@ Endpoints:
     GET /screenshot/desktop - Get full desktop screenshot as PNG
     GET /state              - Get browser state as JSON
     GET /health             - Health check
+    GET /                   - Health check (alias for /health)
     POST /mcp               - MCP Streamable HTTP (AI agent interface)
 """
 
@@ -1144,19 +1145,24 @@ _request_lock = asyncio.Lock()
 async def auth_middleware(request: Request, call_next: Any) -> Any:
     """Reject requests without a valid Bearer token when AUTH_TOKEN is set.
 
-    /health is always allowed so HAProxy health checks work without auth.
+    /health and GET / are always allowed so health checks work without auth.
+    POST / (the command endpoint) still requires auth.
     """
-    if AUTH_TOKEN and request.url.path != "/health":
-        if "auth_token" in request.query_params:
-            return JSONResponse(
-                {"success": False, "error": "Unauthorized"}, status_code=401
-            )
-        auth = request.headers.get("Authorization", "")
-        expected_auth = f"Bearer {AUTH_TOKEN}"
-        if not hmac.compare_digest(auth.encode(), expected_auth.encode()):
-            return JSONResponse(
-                {"success": False, "error": "Unauthorized"}, status_code=401
-            )
+    if AUTH_TOKEN:
+        is_public = request.url.path == "/health" or (
+            request.method == "GET" and request.url.path == "/"
+        )
+        if not is_public:
+            if "auth_token" in request.query_params:
+                return JSONResponse(
+                    {"success": False, "error": "Unauthorized"}, status_code=401
+                )
+            auth = request.headers.get("Authorization", "")
+            expected_auth = f"Bearer {AUTH_TOKEN}"
+            if not hmac.compare_digest(auth.encode(), expected_auth.encode()):
+                return JSONResponse(
+                    {"success": False, "error": "Unauthorized"}, status_code=401
+                )
     return await call_next(request)
 
 
@@ -1320,6 +1326,12 @@ async def handle_state() -> JSONResponse:
 @app.get("/health")
 async def handle_health() -> PlainTextResponse:
     """GET /health - Health check."""
+    return PlainTextResponse("ok")
+
+
+@app.get("/")
+async def handle_root() -> PlainTextResponse:
+    """GET / - Health check (alias for /health)."""
     return PlainTextResponse("ok")
 
 

@@ -21,6 +21,10 @@ test_auth_token() {
     health=$(curl -sf "$base/health" 2>/dev/null || echo "FAIL")
     assert_eq "$health" "ok" "auth: /health works without auth" || { stop_extra_container "$name"; return 1; }
 
+    # GET / must work without auth (blackbox/monitoring probes hit the root path)
+    health=$(curl -sf "$base/" 2>/dev/null || echo "FAIL")
+    assert_eq "$health" "ok" "auth: GET / works without auth" || { stop_extra_container "$name"; return 1; }
+
     # POST / without auth must return 401
     local code
     code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$base" \

@@ -13,7 +13,7 @@
 
 ## Authentication
 
-If `AUTH_TOKEN` is set, all requests (except `/health`) require authentication:
+If `AUTH_TOKEN` is set, all requests (except `/health` and `GET /`) require authentication:
 
 ```
 Authorization: Bearer <token>

@@ -219,7 +219,7 @@ Full docs: [docs/cluster-mode.md](docs/cluster-mode.md)
 
 ## Authentication
 
-Set `AUTH_TOKEN` to require a Bearer token on all requests (except `/health`):
+Set `AUTH_TOKEN` to require a Bearer token on all requests (except `/health` and `GET /`):
 
 ```bash
 docker run -d -p 8080:8080 -e AUTH_TOKEN=your-token-here psyb0t/stealthy-auto-browse

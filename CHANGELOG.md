@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **`GET /` is now a public health check.** With `AUTH_TOKEN` set, the root path previously returned 401, which broke blackbox/monitoring probes that hit the base URL. `GET /` now returns 200 (same as `/health`); `POST /` and all other endpoints still require the Bearer token.
+
 ## [2.1.0] — 2026-07-29
 
 ### Added
