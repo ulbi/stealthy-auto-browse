@@ -16,15 +16,28 @@ done
 # --- Tests that use the shared main container (must run sequentially) ---
 # These use $BASE (the main browser container started by setup)
 MAIN_TESTS=(
+    # test_extensions.sh
+    test_default_extensions_loaded
     # test_api.sh
     test_health
     test_ping
     test_state
     test_goto
     test_page_content
+    test_detect_challenge
+    test_detect_challenge_scroll_into_view
+    test_detect_challenge_raw_dom_selectors
+    # test_fingerprint.sh
+    test_fingerprint_consistency
+    test_liarjs_live_fingerprint_consistency
+    # test_live_behavior.sh (opt-in through make test-real)
+    test_live_deviceandbrowserinfo_behavior
+    test_live_fcaptcha_checkbox_behavior
+    test_live_fcaptcha_invisible_behavior
     test_get_interactive_elements
     test_get_resolution
     test_calibrate
+    test_eval_world
     # test_cookies.sh
     test_set_get_cookies
     test_delete_cookies
@@ -49,6 +62,11 @@ MAIN_TESTS=(
     test_fullscreen
     test_selector_input
     test_click
+    # test_clipboard.sh
+    test_clipboard_roundtrip
+    test_clipboard_browser_copy_paste
+    test_clipboard_validation
+    test_clipboard_run_script
     # test_mcp.sh
     test_mcp
     # test_navigation.sh
@@ -77,6 +95,8 @@ MAIN_TESTS=(
     test_switch_tab_keyboard
     test_switch_tab_no_link_activation
     test_close_tab
+    # test_color_scheme.sh
+    test_color_scheme
     # test_uploads.sh
     test_upload_file
     # test_waits.sh
@@ -87,10 +107,16 @@ MAIN_TESTS=(
     test_recording_double_start
     test_recording_bad_slug
     test_recording_viewport_uses_calibration
+    test_recording_viewport_follows_fullscreen
     test_recording_hide_cursor
     test_recording_slug_collision
     # test_recovery.sh
     test_recovery_camoufox_crash
+    test_recovery_last_tab_closed
+    test_recovery_list_tabs_does_not_open_tab
+    test_recovery_many_tabs_closed
+    test_recovery_new_tab_at_zero_tabs
+    test_recovery_concurrent_requests_open_one_tab
 )
 
 # --- CLI ---
@@ -126,7 +152,16 @@ _ts() {
 }
 
 # Heavy tests that must run alone (not parallel with others)
-HEAVY_TESTS=(test_mcp_cluster_mode test_cluster)
+# Humanized input tests judge timing, so they run alone on a quiet machine.
+HEAVY_TESTS=(
+    test_mcp_cluster_mode
+    test_cluster
+    test_humanized_overrides
+    test_humanized_mouse
+    test_humanized_typing
+    test_humanized_input_off_event_loop
+    test_humanized_scroll
+)
 
 # Classify requested tests into main vs extra vs heavy
 MAIN_TO_RUN=()
@@ -168,6 +203,7 @@ echo ""
 
 FAILED=0
 PASSED=0
+FAILED_TESTS=()
 
 # --- Run main container tests sequentially ---
 
@@ -175,15 +211,16 @@ if [ ${#MAIN_TO_RUN[@]} -gt 0 ]; then
     echo "--- Sequential tests (shared container) ---"
     for t in "${MAIN_TO_RUN[@]}"; do
         local_log="$RESULTS_DIR/${t}.log"
-        echo "=== $t === [$(_ts)]" > "$local_log"
+        echo "=== $t === [$(_ts)]" >"$local_log"
 
         echo -n "[$(_ts)] $t ... "
         test_setup
-        if $t >> "$local_log" 2>&1; then
+        if $t >>"$local_log" 2>&1; then
             PASSED=$((PASSED + 1))
             echo "OK"
         else
             FAILED=$((FAILED + 1))
+            FAILED_TESTS+=("$t")
             echo "FAIL (see tests/results/${t}.log)"
         fi
         test_teardown
@@ -210,6 +247,7 @@ if [ ${#EXTRA_TO_RUN[@]} -gt 0 ]; then
                         echo "[$(_ts)] $_t ... OK"
                     else
                         FAILED=$((FAILED + 1))
+                        FAILED_TESTS+=("$_t")
                         echo "[$(_ts)] $_t ... FAIL (see tests/results/${_t}.log)"
                     fi
                     unset "BG_PIDS[$_t]"
@@ -221,10 +259,10 @@ if [ ${#EXTRA_TO_RUN[@]} -gt 0 ]; then
 
         # Launch test in background
         local_log="$RESULTS_DIR/${t}.log"
-        echo "=== $t === [$(_ts)]" > "$local_log"
+        echo "=== $t === [$(_ts)]" >"$local_log"
         (
             set +e
-            $t >> "$local_log" 2>&1
+            $t >>"$local_log" 2>&1
             exit $?
         ) &
         BG_PIDS["$t"]=$!
@@ -240,6 +278,7 @@ if [ ${#EXTRA_TO_RUN[@]} -gt 0 ]; then
             echo "[$(_ts)] $_t ... OK"
         else
             FAILED=$((FAILED + 1))
+            FAILED_TESTS+=("$_t")
             echo "[$(_ts)] $_t ... FAIL (see tests/results/${_t}.log)"
         fi
     done
@@ -252,14 +291,15 @@ if [ ${#HEAVY_TO_RUN[@]} -gt 0 ]; then
     echo "--- Heavy tests (run alone) ---"
     for t in "${HEAVY_TO_RUN[@]}"; do
         local_log="$RESULTS_DIR/${t}.log"
-        echo "=== $t === [$(_ts)]" > "$local_log"
+        echo "=== $t === [$(_ts)]" >"$local_log"
 
         echo -n "[$(_ts)] $t ... "
-        if $t >> "$local_log" 2>&1; then
+        if $t >>"$local_log" 2>&1; then
             PASSED=$((PASSED + 1))
             echo "OK"
         else
             FAILED=$((FAILED + 1))
+            FAILED_TESTS+=("$t")
             echo "FAIL (see tests/results/${t}.log)"
         fi
     done
@@ -271,11 +311,10 @@ echo "=== [$(_ts)] Results: $PASSED passed, $FAILED failed ==="
 if [ "$FAILED" -gt 0 ]; then
     echo ""
     echo "Failed test logs:"
-    for t in "${TESTS_TO_RUN[@]}"; do
+    for t in "${FAILED_TESTS[@]}"; do
         local_log="$RESULTS_DIR/${t}.log"
-        if [ -f "$local_log" ] && grep -qiE "FAIL" "$local_log" 2>/dev/null; then
-            echo "  tests/results/${t}.log"
-        fi
+        echo "----- tests/results/${t}.log -----"
+        tail -n 200 "$local_log"
     done
     exit 1
 fi

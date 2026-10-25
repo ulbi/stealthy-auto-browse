@@ -7,41 +7,46 @@
 
 Stealth browser automation that actually works. Runs Camoufox (custom Firefox) in Docker with zero Chrome DevTools Protocol exposure, real OS-level mouse and keyboard input via PyAutoGUI, and a JSON HTTP API + MCP server to control it all remotely. Watch it live via noVNC. Run a single instance or spin up a cluster behind HAProxy with Redis cookie sync, request queuing, and sticky sessions. Drive it with curl, pipe YAML scripts through stdin, send multi-step scripts via the API, use page loaders to auto-handle popups and paywalls, or connect AI agents directly via MCP. Optional Bearer token auth via `AUTH_TOKEN`.
 
-Passes Cloudflare, CreepJS, BrowserScan, Pixelscan, and every other bot detector we've thrown at it. While Chromium-based tools are getting caught by the first line of defense, this thing walks through the front door unnoticed.
+The image avoids Chromium CDP signals and keeps its generated Linux font and
+WebGL fingerprints internally consistent. Detection results still depend on the
+site, network exit, timezone, browser build, and test date.
 
-## Table of Contents
+## Table of contents
 
-- [What's Inside](#whats-inside)
-- [Quick Start](#quick-start)
-- [Two Input Modes](#two-input-modes)
-- [Virtual Camera & Microphone](#virtual-camera--microphone)
-- [MCP Server](#mcp-server)
+- [What's inside](#whats-inside)
+- [Quick start](#quick-start)
+- [Two input modes](#two-input-modes)
+- [Clipboard](#clipboard)
+- [Virtual camera & microphone](#virtual-camera--microphone)
+- [MCP server](#mcp-server)
 - [Agent integrations](#agent-integrations)
-- [Script Mode](#script-mode)
-- [Page Loaders](#page-loaders)
-- [Screen Recording](#screen-recording)
-- [Cluster Mode](#cluster-mode)
+- [Script mode](#script-mode)
+- [Page loaders](#page-loaders)
+- [Screen recording](#screen-recording)
+- [Cluster mode](#cluster-mode)
 - [Authentication](#authentication)
 - [Configuration](#configuration)
-- [Bot Detection Results](#bot-detection-results)
+- [Development](#development)
+- [Bot detection results](#bot-detection-results)
+- [Behavioral detection results](#behavioral-detection-results)
 - [License](#license)
 
-## What's Inside
+## What's inside
 
-| Component      | What It Does                                                                                                                                                                                |
+| Component      | What it does                                                                                                                                                                                |
 | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Camoufox**   | A custom build of Firefox with zero Chrome DevTools Protocol exposure. Bot detectors look for CDP signals — this browser simply doesn't have any.                                           |
+| **Camoufox**   | A custom build of Firefox with zero Chrome DevTools Protocol exposure. Bot detectors look for CDP signals, and this browser doesn't have any. Automation scripts run in a JavaScript world the page cannot see. |
 | **Xvfb**       | Virtual framebuffer that lets the browser run with a full graphical display inside a container, no physical monitor needed. This matters because headless mode is another detection signal. |
-| **PyAutoGUI**  | Generates real OS-level mouse movements and keystrokes. The browser receives these as genuine user input — it has no idea it's being automated.                                             |
-| **noVNC**      | Web-based VNC client so you can watch the browser in real time from your own browser. Great for debugging and seeing exactly what's happening.                                              |
-| **Openbox**    | Lightweight window manager — adds title bars and resize handles to popup windows (OAuth dialogs, etc.) that would otherwise be too small to interact with. Zero stealth impact.             |
-| **HTTP API**   | A JSON API on port 8080 that lets you control everything — navigate pages, click elements, type text, take screenshots, manage tabs, handle cookies, and more.                              |
+| **PyAutoGUI**  | Generates real OS-level mouse movements and keystrokes. The page receives them as trusted user input, timed like a person. See [Two input modes](#two-input-modes).                         |
+| **noVNC**      | Web-based VNC client so you can watch the browser in real time from your own browser. The viewer shows the automated pointer at its actual position by default. Set `VNC_SHOW_CURSOR=false` to hide it. |
+| **Openbox**    | Lightweight window manager. It adds title bars and resize handles to popup windows (OAuth dialogs, etc.) that would otherwise be too small to interact with. The main window is sized to fit under its title bar. Zero stealth impact. |
+| **HTTP API**   | A JSON API on port 8080 that lets you control everything: navigate pages, click elements, type text, take screenshots, manage tabs, handle cookies, and more.                               |
 | **MCP Server** | [Model Context Protocol](https://modelcontextprotocol.io/) server at `/mcp` on the same port. AI agents (Claude, etc.) can drive the browser directly over MCP using Streamable HTTP.       |
-| **ffmpeg**     | `x11grab` against Xvfb for screen recording. Captures actual rendered pixels including the OS-level mouse cursor — see [Screen Recording](#screen-recording).                               |
+| **ffmpeg**     | `x11grab` against Xvfb for screen recording. Captures actual rendered pixels including the OS-level mouse cursor. See [Screen Recording](#screen-recording).                                |
 
 Pre-installed extensions: **uBlock Origin** (ads/trackers), **LocalCDN** (prevents CDN tracking), **ClearURLs** (strips tracking params), **Consent-O-Matic** (auto-handles cookie popups).
 
-## Quick Start
+## Quick start
 
 ```bash
 docker run -d --name browser \
@@ -63,12 +68,12 @@ curl -X POST http://localhost:8080 \
   -H "Content-Type: application/json" \
   -d '{"action": "get_text"}'
 
-# Click by CSS selector (preferred — fast and reliable)
+# Click by CSS selector (preferred: fast and reliable)
 curl -X POST http://localhost:8080 \
   -H "Content-Type: application/json" \
   -d '{"action": "click", "selector": "button#submit"}'
 
-# Screenshot (last resort — prefer get_text; always resize to save tokens)
+# Screenshot (last resort; prefer get_text and always resize to save tokens)
 curl "http://localhost:8080/screenshot/browser?whLargest=512" -o screenshot.png
 ```
 
@@ -88,17 +93,42 @@ curl -X POST http://localhost:8080 \
   }'
 ```
 
-Also accepts `"yaml": "..."` with the same YAML format used in script mode. In single-instance mode, requests are serialized automatically — send multiple scripts in parallel and they queue up.
+Also accepts `"yaml": "..."` with the same YAML format used in script mode. In single-instance mode, the server serializes requests automatically. Send multiple scripts in parallel and they queue up.
 
 See [docs/api.md](docs/api.md) for all actions and the full API reference.
 
-## Two Input Modes
+Navigation uses app-owned controls, not a hidden browser-library timeout. Each attempt gets 30 seconds by default, one timeout retry, and a one-second retry delay. Pass `timeout`, `retry_count`, and `retry_delay` with `goto`, `refresh`, or `new_tab` when a workflow needs different bounds. `retry_count: 0` disables retries. See [navigation controls](docs/api.md#navigation) for the limits and retry behavior.
 
-There are two ways to interact with pages. **System input** uses PyAutoGUI to generate real OS-level mouse and keyboard events — the browser cannot tell these apart from a real human. **Playwright input** uses CSS selectors and DOM event injection — easier, but theoretically detectable by behavioral analysis. Use system input on any site with bot protection.
+## Two input modes
+
+There are two ways to interact with pages. **System input** uses PyAutoGUI to generate real OS-level mouse and keyboard events, so the page gets trusted events with no injection trail, timed like a person. **Playwright input** uses CSS selectors and DOM event injection. It's easier, but theoretically detectable by behavioral analysis. Use system input on any site with bot protection.
+
+System input moves and types the way people do. The defaults are fitted to published human datasets (SapiMouse for mouse paths, Balabit for clicks, the Aalto keystroke study for typing):
+
+- **Mouse:** curved sigma-lognormal paths with Fitts's-law timing, a speed peak early in the move, overshoot and correction on about a third of moves, and hand tremor, sent at a 125 Hz mouse rate.
+- **Clicks:** a short pause before the press, a ~100 ms button hold, and a landing point scattered inside the target, never its dead centre.
+- **Typing:** a rhythm that depends on the key pair, a hold on every key, overlapping keys for fast typists, Shift before capitals, and optional typos that are always corrected.
+- **Scrolling:** wheel gestures sent one notch at a time, with reading pauses, pointer drift, and the occasional scroll back.
+
+Each container behaves like one consistent person, and every timing can be overridden per request. The model and options are in [Humanized input](docs/api.md#humanized-input). How it scores against behavioral detectors is in [Behavioral detection results](#behavioral-detection-results).
 
 Full breakdown and usage guide: [docs/stealth.md](docs/stealth.md)
 
-## Virtual Camera & Microphone
+## Clipboard
+
+`set_clipboard` and `get_clipboard` use the real X11 text clipboard shared by Camoufox and noVNC. Text copied in the browser can be read through the API, and text set through the API can be pasted with `Ctrl+V`. Values must be valid UTF-8 and may contain at most 1 MiB.
+
+```bash
+curl -X POST http://localhost:8080 -H "Content-Type: application/json" \
+  -d '{"action":"set_clipboard","text":"paste me"}'
+
+curl -X POST http://localhost:8080 -H "Content-Type: application/json" \
+  -d '{"action":"get_clipboard"}'
+```
+
+Both actions are dedicated MCP tools. In cluster mode, use them inside one `run_script` call so one browser instance owns both operations. See [the API reference](docs/api.md#clipboard).
+
+## Virtual camera & microphone
 
 Mount test media read-only at `/media` and set `VIRTUAL_CAMERA_FILE` and/or `VIRTUAL_MICROPHONE_FILE`. Pages that call `navigator.mediaDevices.getUserMedia()` receive tracks captured from those files, so camera and microphone checks can run without host hardware.
 
@@ -112,13 +142,15 @@ docker run -d -p 8080:8080 \
 
 Sources must remain inside `/media`; restart the browser after changing them. A request for a kind without a configured virtual source fails with `NotFoundError` rather than falling back to hardware. Virtual tracks use the source file's native format, so pages must not require incompatible exact media constraints. This virtualizes `getUserMedia()` only, not `enumerateDevices()`.
 
-To switch sources during an authorized test without replacing an already acquired camera or microphone track, enable `VIRTUAL_MEDIA_DYNAMIC=true`. Dynamic mode is disabled by default. Use `set_virtual_media_source` to choose an existing relative file name under `VIRTUAL_MEDIA_DIR`, or `upload_virtual_media` to add bounded base64 content and optionally activate it. An upload filename is only a safe, type-matching media name; the service generates a collision-safe stored basename, returns it, and never overwrites an existing named source. Before storage or activation, the decoded upload is checked with `ffprobe` for a stream matching the requested camera or microphone kind. The media directory must be writable for uploads; `VIRTUAL_MEDIA_UPLOAD_MAX_BYTES` defaults to 50 MiB. Existing page streams keep their track identities while the source changes.
+To switch sources during an authorized test without replacing an already acquired camera or microphone track, enable `VIRTUAL_MEDIA_DYNAMIC=true`. Dynamic mode is off by default. Use `set_virtual_media_source` to choose an existing relative file name under `VIRTUAL_MEDIA_DIR`, or `upload_virtual_media` to add bounded base64 content and optionally activate it. An upload filename is only a safe, type-matching media name; the service generates a collision-safe stored basename, returns it, and never overwrites an existing named source. Before storage or activation, the service checks the decoded upload with `ffprobe` for a stream matching the requested camera or microphone kind. The media directory must be writable for uploads; `VIRTUAL_MEDIA_UPLOAD_MAX_BYTES` defaults to 50 MiB. Existing page streams keep their track identities while the source changes.
 
-Dynamic mode accepts files from the configured media directory only. It does not accept arbitrary host paths, remote URLs, WebSocket streams, or other live ingress. Both actions use the normal API authentication: when `AUTH_TOKEN` is set, send the usual `Authorization: Bearer <token>` header. See [docs/api.md#virtual-camera-and-microphone](docs/api.md#virtual-camera-and-microphone) and [docs/configuration.md](docs/configuration.md) for the action contract and writable-volume setup.
+Dynamic mode accepts files from the configured media directory only. It does not accept arbitrary host paths, remote URLs, WebSocket streams, or other live ingress. Both actions use the normal API authentication. When `AUTH_TOKEN` is set, send the usual `Authorization: Bearer <token>` header. See [docs/api.md#virtual-camera-and-microphone](docs/api.md#virtual-camera-and-microphone) and [docs/configuration.md](docs/configuration.md) for the action contract and writable-volume setup.
 
-## MCP Server
+## MCP server
 
-AI agents can control the browser over the [Model Context Protocol](https://modelcontextprotocol.io/) via Streamable HTTP at `/mcp` on the same port 8080. All browser actions are exposed as MCP tools — navigation, screenshots, clicking, typing, JavaScript evaluation, cookies, and more.
+AI agents can control the browser over the [Model Context Protocol](https://modelcontextprotocol.io/) via Streamable HTTP at `/mcp` on the same port 8080. The server exposes all browser actions as MCP tools: navigation, screenshots, clicking, typing, JavaScript evaluation, cookies, and more.
+
+For authorised test flows that need a human review when a verification widget appears, use `detect_challenge`. It is read-only. It reports a best-effort `absent`, `present`, or `unknown` status with bounded vendor/location evidence, but never clicks, enters a frame, or solves a challenge. Pass `scroll_into_view: true` to bring the first visible detected frame or widget into the viewport for VNC handoff; it still never clicks or focuses it. In cluster mode, include it as a `run_script` step. See [the API reference](docs/api.md#challenge-detection).
 
 Connect any MCP-compatible client (Claude Desktop, Claude Code, custom agents) to `http://localhost:8080/mcp/` and start browsing.
 
@@ -126,7 +158,7 @@ Works in both standalone and [cluster mode](#cluster-mode).
 
 ## Agent integrations
 
-The [skill](.agents/skills/stealthy-auto-browse) works in any agent that reads `.agents/skills/`, and installs natively in the clients below.
+The [skill](.agents/skills/stealthy-auto-browse) works in any agent that reads `.agents/skills/` (such as [peen](https://github.com/psyb0t/peen)), and installs natively in the clients below.
 
 ### Claude Code
 
@@ -135,7 +167,7 @@ claude plugin marketplace add psyb0t/agents
 claude plugin install stealthy-auto-browse@psyb0t
 ```
 
-Claude Code prompts for the stealthy-auto-browse URL and, if auth is enabled, the token — the token is stored in your OS keychain.
+Claude Code prompts for the stealthy-auto-browse URL and, if auth is enabled, the token, which it stores in your OS keychain.
 
 ### Codex
 
@@ -162,7 +194,7 @@ openclaw plugins install clawhub:@psyb0t/stealthy-auto-browse
 
 Then set `STEALTHY_AUTO_BROWSE_URL` (and `AUTH_TOKEN` if the server requires auth).
 
-## Script Mode
+## Script mode
 
 Pipe a YAML script into the container, get JSON results on stdout, container exits. No HTTP server. Good for CI, cron jobs, one-shot scraping.
 
@@ -176,15 +208,15 @@ Full docs: [docs/script-mode.md](docs/script-mode.md)
 
 Script mode also supports explicit `if` branches plus bounded `repeat` and `while` loops. Conditions can inspect elements, visible text, URLs, JavaScript booleans, and prior `output_id` values; see [the control-flow reference](docs/script-mode.md#control-flow).
 
-## Page Loaders
+## Page loaders
 
-Define URL patterns + action sequences in YAML files. Mount them at `/loaders`. Whenever `goto` matches a pattern, the loader runs automatically — removes popups, waits for content, cleans up the page. Greasemonkey for the HTTP API.
+Define URL patterns + action sequences in YAML files. Mount them at `/loaders`. Whenever `goto` matches a pattern, the loader runs automatically. It removes popups, waits for content, and cleans up the page. Greasemonkey for the HTTP API.
 
 Full docs: [docs/page-loaders.md](docs/page-loaders.md)
 
-## Screen Recording
+## Screen recording
 
-Record the browser as MP4 with mouse cursor visible. ffmpeg `x11grab` against Xvfb writes to a mounted `/recordings` volume. Three modes: `window` (full Camoufox window), `viewport` (chrome cropped using calibrated `mozInnerScreenX/Y`), `desktop` (entire Xvfb screen). Slug provided at stop time so you name the file after the run completes. Path-traversal-safe, collision-safe, crash-safe.
+Record the browser as MP4 with mouse cursor visible. ffmpeg `x11grab` against Xvfb writes to a mounted `/recordings` volume. Three modes: `window` (full Camoufox window), `viewport` (chrome cropped at the page position from `mozInnerScreenX/Y`, measured when recording starts), `desktop` (entire Xvfb screen). You provide the slug at stop time, so you name the file after the run completes. Path-traversal-safe, collision-safe, crash-safe.
 
 ```bash
 mkdir -p ./recordings
@@ -206,7 +238,7 @@ curl -X POST http://localhost:8080 \
 
 Also works inside `run_script` (cluster-mode safe: start and stop must live in the same `run_script` so both hit the same instance). Full action table + script-mode example + notes in [docs/api.md#screen-recording](docs/api.md#screen-recording).
 
-## Cluster Mode
+## Cluster mode
 
 Run multiple browser instances behind HAProxy with a request queue, sticky sessions, and Redis cookie sync (default 5, configurable via `NUM_REPLICAS`). Download the compose file and HAProxy config, then start:
 
@@ -219,7 +251,7 @@ Cookies set on any instance propagate to all others instantly via Redis PubSub. 
 
 Each browser defaults to a 5GB memory limit. Set `BROWSER_MEMORY_LIMIT` and `BROWSER_MEMORY_RESERVATION` when your fleet or display resolution needs a different budget; see [cluster mode](docs/cluster-mode.md#environment-variables).
 
-**Script-only enforcement (v1.0.0+):** When `NUM_REPLICAS > 1`, both the HTTP API and MCP server restrict to `run_script` only (plus `ping` and `sleep`). Individual actions are rejected to prevent stale content bugs from cross-instance routing. All actions remain available as steps inside `run_script`.
+**Script-only enforcement (v1.0.0+):** When `NUM_REPLICAS > 1`, both the HTTP API and MCP server restrict to `run_script` only (plus `ping` and `sleep`). They reject individual actions to prevent stale content bugs from cross-instance routing. All actions remain available as steps inside `run_script`.
 
 Full docs: [docs/cluster-mode.md](docs/cluster-mode.md)
 
@@ -242,17 +274,38 @@ curl -H "Authorization: Bearer your-token-here" http://localhost:8080 ...
 
 See [`.agents/skills/stealthy-auto-browse/scripts/`](.agents/skills/stealthy-auto-browse/scripts/) for ready-to-use scripts:
 
-- **[`websearch.py`](.agents/skills/stealthy-auto-browse/scripts/websearch.py)** — Multi-engine parallel web search (Brave, Google, Bing) with structured results and AI overview extraction. Outputs JSON with title, URL, and snippet for each result.
+- **[`websearch.py`](.agents/skills/stealthy-auto-browse/scripts/websearch.py)**: Multi-engine parallel web search (Brave, Google, Bing) with structured results and AI overview extraction. Outputs JSON with title, URL, and snippet for each result.
 
 ## Configuration
 
-Full environment variables table, proxy setup, persistent profiles, browser extensions, and VNC access: [docs/configuration.md](docs/configuration.md)
+Full environment variables table, proxy setup (including a working private [pr0xteus](https://github.com/psyb0t/pr0xteus) HTTP-proxy example), persistent profiles, browser extensions, and VNC access: [docs/configuration.md](docs/configuration.md)
 
-## Bot Detection Results
+## Development
 
-| Service                                                                | Result   | What They Check                                                         |
-| ---------------------------------------------------------------------- | -------- | ----------------------------------------------------------------------- |
-| [CreepJS](https://abrahamjuliot.github.io/creepjs/)                    | **Pass** | Canvas/WebGL fingerprint consistency, lies detection, worker comparison |
+Docker is the only development dependency. The Makefile builds a local browser base, then runs linting, tests, and security tools in a separate disposable dev container. Only the complete test target receives the Docker socket because it starts its own browser and fixture containers.
+
+```bash
+make build
+make lint
+make test
+make test-real
+make sec
+```
+
+`make sec` writes `sec.sarif` for GitHub Security. It reports findings without blocking a release. Use `make help` for the complete command list.
+
+`make test-real` runs opt-in live checks against public sites, so it needs outbound network access and does not run in the deterministic default suite. It checks fingerprint consistency on [liarjs.dev](https://liarjs.dev/), and input behavior on the [deviceandbrowserinfo.com login test](https://deviceandbrowserinfo.com/are_you_a_bot_interactions) and the [FCaptcha demo](https://www.webdecoy.com/product/fcaptcha-demo) in checkbox and invisible modes. Each behavior check runs the same task with humanized input, Playwright DOM input, and raw PyAutoGUI on the same IP. The humanized run must pass, and both robotic runs must fail or score worse, which proves the service really scores behavior.
+
+## Bot detection results
+
+These are observed results, not a promise that every version of each service
+will return the same result. Test the exact image, proxy, timezone, and target
+flow you plan to use.
+
+| Service                                                                | Observed result                  | What they check                                                         |
+| ---------------------------------------------------------------------- | -------------------------------- | ----------------------------------------------------------------------- |
+| [CreepJS](https://abrahamjuliot.github.io/creepjs/)                    | **Pass**                         | Canvas/WebGL fingerprint consistency, lies detection, worker comparison |
+| [liarjs.dev](https://liarjs.dev/)                                      | **82/100, no critical findings** | Font, canvas, worker, GPU, network, and behavioral consistency          |
 | [BrowserScan](https://www.browserscan.net/bot-detection)               | **Pass** | WebDriver flag, CDP signals, navigator properties                       |
 | [Pixelscan](https://pixelscan.net/)                                    | **Pass** | Fingerprint coherence, timezone/IP match, WebRTC leaks                  |
 | [Cloudflare](https://cloudflare.com)                                   | **Pass** | Challenge pages, Turnstile, bot management                              |
@@ -266,9 +319,20 @@ Full environment variables table, proxy setup, persistent profiles, browser exte
 
 Why it works: [docs/stealth.md](docs/stealth.md)
 
-## Known Issues / TODO
+## Behavioral detection results
 
-- **`system_click` reliability** — OS-level mouse clicks can land in the wrong place if the window offset is stale. Needs a more robust coordinate mapping solution so it works reliably without manual `calibrate` calls.
+A clean fingerprint says what the browser is. Behavioral detectors watch what it does: how the pointer travels, how long keys and buttons stay down, how the wheel turns. Each check below runs the same task three ways from one container and one IP, so the fingerprint and network are identical and only the input differs.
+
+| Check                                                                                          | Humanized system input | Playwright DOM input | Raw PyAutoGUI |
+| ---------------------------------------------------------------------------------------------- | ---------------------- | -------------------- | ------------- |
+| [DeviceAndBrowserInfo login test](https://deviceandbrowserinfo.com/are_you_a_bot_interactions) | **human**              | bot                  | bot           |
+| [FCaptcha](https://www.webdecoy.com/product/fcaptcha-demo) checkbox                            | **verified**           | failed               | failed        |
+| [FCaptcha](https://www.webdecoy.com/product/fcaptcha-demo) invisible risk score (lower is better) | **0.06, allowed**   | 0.60, blocked        | 0.22, allowed |
+| [motion-attestation](https://github.com/libcaptcha/motion-attestation) and [Gaitcha](https://github.com/willybahuaud/gaitcha): mouse, typing, scroll | **pass** | not run | caught |
+
+Raw PyAutoGUI sends the same trusted OS-level events, but with straight instant moves and zero-length holds. Two of the three hosted checks flag it outright, and the third scores it almost four times riskier. Trusted events alone are not enough. The humanized timing is what passes.
+
+The hosted rows were observed with `make test-real`, which asserts this pattern on every run: the humanized run must pass, and both robotic runs must fail or score clearly worse. The offline detectors run on every `make test` against a local probe page, and each of those checks also plays a robotic session that must be caught. Like the fingerprint results, the hosted scores depend on the service version, network exit, and timezone.
 
 ## License
 

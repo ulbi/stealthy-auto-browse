@@ -1,49 +1,40 @@
 # Setup
 
-## Authorized Use Reminder
+## Authorized use reminder
 
-This skill is intended for authorized QA, compatibility testing, and defensive security research against sites you own or have written permission to test. Read the "Authorized Use Only" section of `SKILL.md` before configuring this for any non-trivial deployment.
+This skill is intended for authorized QA, compatibility testing, and defensive security research against sites you own or have written permission to test. Read the "Authorized use only" section of `SKILL.md` before configuring this for any non-trivial deployment.
 
 ## Requirements
 
 - Docker
 - curl
 
-## Secure Defaults — Apply These First
+## Secure defaults: apply these first
 
 Before running anything beyond a throwaway local smoke test:
 
 1. **Bind to loopback.** Map ports as `-p 127.0.0.1:8080:8080` (and `127.0.0.1:5900:5900` if you need the viewer) so the API is not reachable from other machines on the network.
 2. **Set `AUTH_TOKEN` to a strong random value.** `-e AUTH_TOKEN=$(openssl rand -hex 32)`. Required as soon as the service is reachable beyond localhost. Pass it via `Authorization: Bearer <key>` headers.
-3. **Pin the image by digest.** Tags are mutable — pin the digest you've reviewed:
-   ```bash
-   docker pull psyb0t/stealthy-auto-browse:v1.0.0
-   docker inspect --format='{{index .RepoDigests 0}}' psyb0t/stealthy-auto-browse:v1.0.0
-   # → psyb0t/stealthy-auto-browse@sha256:7ce5d42ddb3b7fdbfb4af2d4bf6072f5a862d5dd2b64c7feb496e493f587223c
-   ```
-   Use the `@sha256:...` form in every `docker run` and compose file. Re-pull and re-pin only when consciously upgrading.
+3. **Pull the image before you start.** `docker pull psyb0t/stealthy-auto-browse:latest` gets the current release. Pull again and recreate the container to upgrade.
 4. **Don't mount the docker socket.** Don't run with `--privileged`. Don't grant the container egress beyond what the test target needs (use a Docker network with restricted egress where supported).
 5. **Don't persist real session data.** If you mount `/userdata`, use a dedicated test account, encrypt the volume host-side if it leaves the machine, and shred (`rm -rf`) it when the test concludes.
-6. **Disable the noVNC viewer if you don't need it.** Don't publish port 5900. If you do publish it for local debugging, bind it to `127.0.0.1` and never expose it on a public interface — the viewer gives full keyboard/mouse control of the browser, including any logged-in sessions.
+6. **Disable the noVNC viewer if you don't need it.** Don't publish port 5900. If you do publish it for local debugging, bind it to `127.0.0.1` and never expose it on a public interface. The viewer gives full keyboard/mouse control of the browser, including any logged-in sessions.
 
-## Quick Start (localhost, no auth — for smoke tests only)
+## Quick start (localhost, no auth, for smoke tests only)
 
 ```bash
-DIGEST=sha256:7ce5d42ddb3b7fdbfb4af2d4bf6072f5a862d5dd2b64c7feb496e493f587223c
-
 docker run -d --name browser \
   -p 127.0.0.1:8080:8080 \
   -p 127.0.0.1:5900:5900 \
-  psyb0t/stealthy-auto-browse@$DIGEST
+  psyb0t/stealthy-auto-browse:latest
 ```
 
 **Verify:** `curl http://127.0.0.1:8080/health` returns `ok` when the browser is ready (~10s first boot).
 **Watch the browser:** `http://127.0.0.1:5900/` in your own browser.
 
-## Recommended Run (auth enabled, hardened)
+## Recommended run (auth enabled, hardened)
 
 ```bash
-DIGEST=sha256:7ce5d42ddb3b7fdbfb4af2d4bf6072f5a862d5dd2b64c7feb496e493f587223c
 TOKEN=$(openssl rand -hex 32)
 echo "AUTH_TOKEN=$TOKEN" > .env.browser   # gitignored
 chmod 600 .env.browser
@@ -57,72 +48,75 @@ docker run -d --name browser \
   --security-opt=no-new-privileges \
   --read-only \
   --tmpfs /tmp:rw,noexec,nosuid \
-  psyb0t/stealthy-auto-browse@$DIGEST
+  psyb0t/stealthy-auto-browse:latest
 ```
 
 Notes on the hardening flags:
 
 - `HTTP_LISTEN_HOST=0.0.0.0` makes the API reachable inside the container on all interfaces, but the `-p 127.0.0.1:8080:8080` mapping confines it to host loopback. This is the correct combination.
-- `SYS_ADMIN` is needed by the embedded Firefox sandbox; everything else is dropped.
+- The embedded Firefox sandbox needs `SYS_ADMIN`; `--cap-drop=ALL` drops everything else.
 - Adjust `--read-only` if you need `/userdata` mounted (you'll have to mount that path writable).
-- Same applies to `/recordings` if you use screen recording — mount it writable, which means dropping or adjusting `--read-only` for that path too.
+- Same applies to `/recordings` if you use screen recording. Mount it writable, which means dropping or adjusting `--read-only` for that path too.
 - Dynamic virtual-media uploads also need a writable `VIRTUAL_MEDIA_DIR`; static virtual media may remain read-only.
 
-## Environment Variables
+## Environment variables
 
-| Variable | Default | What It Does |
+| Variable | Default | What it does |
 |----------|---------|-------------|
 | `XVFB_RESOLUTION` | `1920x1080` | Virtual display resolution. Any size works (e.g. `1920x1920`, `2560x1440`); the framebuffer is allocated to match, so screen recording captures this exact size. Larger = more memory. |
 | `XVFB_DEPTH` | `24` | Color depth (16/24/32). |
 | `TZ` | `UTC` | Match your IP location for realistic test fingerprints. |
-| `PROXY_URL` | — | HTTP proxy for all browser traffic. Format: `http://user:pass@host:port`. Use only proxies you own or are authorized to use. |
+| `PROXY_URL` | unset | Proxy for all browser traffic: `http://user:pass@host:port` or `socks5://host:port`. **Camoufox (Firefox) does not reliably support authenticated SOCKS5**, so use HTTP for any credentialed exit (unauthenticated SOCKS5 is fine). Only use exits you own or are authorized to use. [pr0xteus](https://github.com/psyb0t/pr0xteus) v0.11.0+ hands out an authenticated HTTP forward-proxy per lease (read `proxies.http`); reach it over the host network or a published address. |
 | `LOADERS_DIR` | `/loaders` | Directory for page loader YAML files. |
 | `USE_VIEWPORT` | `false` | Playwright viewport control. Required for width < ~450px. Makes automation easier to fingerprint. |
 | `HTTP_LISTEN_HOST` | `0.0.0.0` | HTTP API bind address inside the container. Combine with a `127.0.0.1:8080:8080` port mapping to confine to localhost on the host. |
 | `HTTP_LISTEN_PORT` | `8080` | HTTP API port. |
-| `AUTH_TOKEN` | — | **Set this for any non-trivial deployment.** Without it, anyone who can reach the port can control the browser. With it, requests need an `Authorization: Bearer <key>` header. |
+| `AUTH_TOKEN` | unset | **Set this for any non-trivial deployment.** Without it, anyone who can reach the port can control the browser. With it, requests need an `Authorization: Bearer <key>` header. |
 | `VIRTUAL_MEDIA_DIR` | `/media` | Directory containing virtual camera/microphone media. Configured and dynamic source paths must resolve within it. Mount it read-only for static sources; dynamic uploads require it to be writable. |
-| `VIRTUAL_CAMERA_FILE` | — | Video file returned as the video track from page `getUserMedia()`. Relative to `VIRTUAL_MEDIA_DIR` or an absolute path inside it. A request for video without this source fails with `NotFoundError`. |
-| `VIRTUAL_MICROPHONE_FILE` | — | Audio file returned as the audio track from page `getUserMedia()`. Relative to `VIRTUAL_MEDIA_DIR` or an absolute path inside it. A request for audio without this source fails with `NotFoundError`. |
+| `VIRTUAL_CAMERA_FILE` | unset | Video file returned as the video track from page `getUserMedia()`. Relative to `VIRTUAL_MEDIA_DIR` or an absolute path inside it. A request for video without this source fails with `NotFoundError`. |
+| `VIRTUAL_MICROPHONE_FILE` | unset | Audio file returned as the audio track from page `getUserMedia()`. Relative to `VIRTUAL_MEDIA_DIR` or an absolute path inside it. A request for audio without this source fails with `NotFoundError`. |
 | `VIRTUAL_MEDIA_DYNAMIC` | `false` | Enables runtime file-backed source selection and upload for virtual camera/microphone tests. |
 | `VIRTUAL_MEDIA_UPLOAD_MAX_BYTES` | `50 MiB` | Maximum decoded upload size accepted by `upload_virtual_media` in dynamic mode. |
 | `VNC_LISTEN_HOST` | `0.0.0.0` | VNC bind address inside the container. As above, prefer a `127.0.0.1:5900:5900` host port mapping. |
-| `VNC_LISTEN_PORT` | `5900` | noVNC web viewer port. **The viewer has no authentication of its own** — only publish to localhost. |
-| `PUID` | `1000` | Run the container as this UID. Ownership of `/userdata`, `/loaders`, `/recordings` is fixed up to match at startup. |
+| `VNC_LISTEN_PORT` | `5900` | noVNC web viewer port. **The viewer has no authentication of its own**, so only publish to localhost. |
+| `VNC_SHOW_CURSOR` | `true` | Shows the actual automated pointer position in noVNC. Set to `false` to hide it. Only `true` and `false` are accepted. |
+| `PUID` | `1000` | Run the container as this UID. At startup the container fixes ownership of `/userdata`, `/loaders`, `/recordings` to match. |
 | `PGID` | value of `PUID` | Run the container as this GID. |
 | `LANG` | `en_US.UTF-8` | Browser locale/language. |
 | `LOG_LEVEL` | `INFO` | One of `DEBUG`, `INFO`, `WARNING`, `ERROR` for the JSON logger. |
-| `LOG_FILE` | — | If set, also write JSON logs to this file (10MB x 5 rotation) in addition to stderr. |
+| `LOG_FILE` | unset | If set, also write JSON logs to this file (10MB x 5 rotation) in addition to stderr. |
 
-## Common Configurations
+## Common configurations
 
 ```bash
-DIGEST=sha256:7ce5d42ddb3b7fdbfb4af2d4bf6072f5a862d5dd2b64c7feb496e493f587223c
-
 # Match timezone for realistic fingerprint during testing
 docker run -d -p 127.0.0.1:8080:8080 \
   -e TZ=Europe/Bucharest \
   --env-file .env.browser \
-  psyb0t/stealthy-auto-browse@$DIGEST
+  psyb0t/stealthy-auto-browse:latest
 
 # Route through your authorized proxy
 docker run -d -p 127.0.0.1:8080:8080 \
   -e PROXY_URL=http://user:pass@proxy.you-own.example:8888 \
   --env-file .env.browser \
-  psyb0t/stealthy-auto-browse@$DIGEST
+  psyb0t/stealthy-auto-browse:latest
+
+# For a private pr0xteus (v0.11.0+) HTTP proxy, allocate a lease, read its
+# proxies.http URL, and pass that as PROXY_URL (Camoufox can't reliably do authenticated SOCKS5).
+# The working allocation-to-browser command sequence is in docs/configuration.md.
 
 # Custom resolution
 docker run -d -p 127.0.0.1:8080:8080 \
   -e XVFB_RESOLUTION=1280x720 \
   --env-file .env.browser \
-  psyb0t/stealthy-auto-browse@$DIGEST
+  psyb0t/stealthy-auto-browse:latest
 
-# Persistent profile — TEST ACCOUNTS ONLY, shred when done
+# Persistent profile: TEST ACCOUNTS ONLY, shred when done
 mkdir -p ./profile && chmod 700 ./profile
 docker run -d -p 127.0.0.1:8080:8080 \
   -v ./profile:/userdata \
   --env-file .env.browser \
-  psyb0t/stealthy-auto-browse@$DIGEST
+  psyb0t/stealthy-auto-browse:latest
 # When the test run ends:
 docker rm -f browser && rm -rf ./profile
 
@@ -130,21 +124,21 @@ docker rm -f browser && rm -rf ./profile
 docker run -d -p 127.0.0.1:9090:9090 -p 127.0.0.1:6900:6900 \
   -e HTTP_LISTEN_PORT=9090 -e VNC_LISTEN_PORT=6900 \
   --env-file .env.browser \
-  psyb0t/stealthy-auto-browse@$DIGEST
+  psyb0t/stealthy-auto-browse:latest
 
 # With page loaders
 docker run -d -p 127.0.0.1:8080:8080 \
   -v ./my-loaders:/loaders \
   --env-file .env.browser \
-  psyb0t/stealthy-auto-browse@$DIGEST
+  psyb0t/stealthy-auto-browse:latest
 
-# With screen recording — /recordings must be mounted writable or
+# With screen recording. /recordings must be mounted writable or
 # start_recording fails fast
 mkdir -p ./recordings
 docker run -d -p 127.0.0.1:8080:8080 \
   -v ./recordings:/recordings \
   --env-file .env.browser \
-  psyb0t/stealthy-auto-browse@$DIGEST
+  psyb0t/stealthy-auto-browse:latest
 
 # File-backed virtual camera and microphone for an authorized WebRTC test
 mkdir -p ./media
@@ -153,7 +147,7 @@ docker run -d -p 127.0.0.1:8080:8080 \
   -e VIRTUAL_CAMERA_FILE=camera.webm \
   -e VIRTUAL_MICROPHONE_FILE=microphone.wav \
   --env-file .env.browser \
-  psyb0t/stealthy-auto-browse@$DIGEST
+  psyb0t/stealthy-auto-browse:latest
 
 # Dynamic file-backed media for an authorized compatibility test.
 # The media mount must be writable only when uploads are needed.
@@ -161,7 +155,7 @@ docker run -d -p 127.0.0.1:8080:8080 \
   -v ./media:/media:rw \
   -e VIRTUAL_MEDIA_DYNAMIC=true \
   --env-file .env.browser \
-  psyb0t/stealthy-auto-browse@$DIGEST
+  psyb0t/stealthy-auto-browse:latest
 ```
 
 With `VIRTUAL_MEDIA_DYNAMIC=true`, use authenticated `set_virtual_media_source`
@@ -180,7 +174,7 @@ not accept arbitrary host paths, remote URLs, WebSocket streams, or other live
 ingress. When `AUTH_TOKEN` is set, send the same `Authorization: Bearer <key>` header
 used for every other action.
 
-## OpenClaw / ClawHub Config
+## OpenClaw / ClawHub config
 
 ```bash
 export STEALTHY_AUTO_BROWSE_URL=http://127.0.0.1:8080
@@ -206,39 +200,35 @@ Or via `~/.openclaw/openclaw.json`:
 
 Keep `~/.openclaw/openclaw.json` mode `600` if it contains real tokens, or read the token from a separate file the config refers to.
 
-## Cluster Mode Setup
+## Cluster mode setup
 
-Run multiple browser instances behind HAProxy with request queuing, sticky sessions, and Redis cookie sync. The number of instances is controlled by `NUM_REPLICAS` (default: 10):
+Run multiple browser instances behind HAProxy with request queuing, sticky sessions, and Redis cookie sync. `NUM_REPLICAS` sets the number of instances (default: 10).
 
-**Do not pipe the compose file from a moving branch.** Download it, review it, and pin to a release tag or commit SHA you've audited:
+Download the compose file and read it before you start it. Don't pipe it straight into `docker compose`:
 
 ```bash
-# Pick a release tag (or commit SHA) you've reviewed.
-RELEASE=v1.0.0
-
-# Download to a local file — do NOT pipe directly into docker compose.
+# Download to a local file.
 curl -fsSL -o docker-compose.cluster.yml \
-  "https://raw.githubusercontent.com/psyb0t/docker-stealthy-auto-browse/${RELEASE}/docker-compose.cluster.yml"
+  "https://raw.githubusercontent.com/psyb0t/docker-stealthy-auto-browse/main/docker-compose.cluster.yml"
 
 # Read it. Confirm the images, networks, and volume mounts match what you expect.
 $EDITOR docker-compose.cluster.yml
 
-# Pin each image in the compose file to a digest you've verified before bringing it up.
 docker compose -f docker-compose.cluster.yml up -d
 ```
 
-Entry point is `http://127.0.0.1:8080` — same API and MCP endpoint as single-container mode. Bind HAProxy's published port to `127.0.0.1` in the compose file unless you have a deliberate reason for broader exposure.
+Entry point is `http://127.0.0.1:8080`, with the same API and MCP endpoint as single-container mode. Bind HAProxy's published port to `127.0.0.1` in the compose file unless you have a deliberate reason for broader exposure.
 
 Set `STEALTHY_AUTO_BROWSE_URL=http://127.0.0.1:8080` and `AUTH_TOKEN=...` as usual.
 
-## Pre-installed Extensions
+## Pre-installed extensions
 
-- **uBlock Origin** — ad/tracker blocking
-- **LocalCDN** — serves CDN resources locally
-- **ClearURLs** — strips tracking parameters
-- **Consent-O-Matic** — auto-handles cookie popups
+- **uBlock Origin**: ad/tracker blocking
+- **LocalCDN**: serves CDN resources locally
+- **ClearURLs**: strips tracking parameters
+- **Consent-O-Matic**: auto-handles cookie popups
 
-## Tear-Down
+## Tear-down
 
 When a test run is done:
 
@@ -248,4 +238,4 @@ rm -rf ./profile               # shred persisted session data if you mounted /us
 rm -f .env.browser             # rotate / remove the AUTH_TOKEN file
 ```
 
-Rotate any test-account credentials that were exercised by the run if those accounts are used by humans too.
+If humans also use the test accounts the run exercised, rotate their credentials.

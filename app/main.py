@@ -20,22 +20,34 @@ from __future__ import annotations
 import asyncio
 import hmac
 import io
+import math
 import os
-import random
 import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import uvicorn
 import yaml
-from browser import Browser, BrowserConfig, BrowserError
+from browser import (
+    COLOR_SCHEME_DEFAULT,
+    COLOR_SCHEMES,
+    MAIN_WORLD_PREFIX,
+    Browser,
+    BrowserConfig,
+    BrowserError,
+)
+from clipboard import Clipboard, ClipboardError, redact_clipboard_params
 from fastapi import FastAPI, Request
 from PIL import Image
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from recorder import Recorder, RecorderError, cleanup_orphan_tmp_files
+from challenge_detector import detect_challenges
 from script_runner import ScriptValidationError, load_script, run_script, validate_script
 from starlette.responses import JSONResponse, PlainTextResponse, Response
+import input_actions
 from system import System
 
 from loaders import find_loader, load_loaders, substitute_url
@@ -79,7 +91,10 @@ def _safe_request_id(incoming: str) -> str:
 def log_request(action: str, params: dict | None = None) -> None:
     """Log incoming action with structured fields. Redactor masks tokens."""
     if params:
-        log.info("request", extra={"action": action, "params": params})
+        log.info(
+            "request",
+            extra={"action": action, "params": redact_clipboard_params(action, params)},
+        )
     else:
         log.info("request", extra={"action": action})
 
@@ -105,6 +120,8 @@ system = System()
 # Screen recorder (ffmpeg x11grab)
 recorder = Recorder()
 
+clipboard = Clipboard()
+
 # Global browser instance
 browser: Browser | None = None
 
@@ -125,6 +142,7 @@ _DIALOG_BUTTONS: dict[str, list[str]] = {
 
 # Tab management
 _active_page: Any = None
+_page_heal_lock = asyncio.Lock()
 
 # Download tracking
 _last_download: dict | None = None
@@ -147,6 +165,40 @@ _NUM_REPLICAS = int(os.environ.get("NUM_REPLICAS", "1"))
 _CLUSTER_MODE = _NUM_REPLICAS > 1
 _CLUSTER_ALLOWED_ACTIONS = {"run_script", "ping", "sleep"}
 _NAVIGATION_INTERRUPTED_ERROR = "interrupted by another navigation"
+
+# Where the eval action runs. "page" sees the page's own JavaScript state;
+# "isolated" sees only the DOM, and page code cannot observe or hook it.
+EVAL_WORLD_PAGE = "page"
+EVAL_WORLD_ISOLATED = "isolated"
+EVAL_WORLDS = (EVAL_WORLD_PAGE, EVAL_WORLD_ISOLATED)
+
+NAVIGATION_TIMEOUT_DEFAULT_SECONDS = 30.0
+NAVIGATION_RETRY_COUNT_DEFAULT = 1
+NAVIGATION_RETRY_DELAY_DEFAULT_SECONDS = 1.0
+
+_NAVIGATION_MIN_TIMEOUT_SECONDS = 0.1
+_NAVIGATION_MAX_TIMEOUT_SECONDS = 120.0
+_NAVIGATION_MIN_RETRY_COUNT = 0
+_NAVIGATION_MAX_RETRY_COUNT = 2
+_NAVIGATION_MIN_RETRY_DELAY_SECONDS = 0.0
+_NAVIGATION_MAX_RETRY_DELAY_SECONDS = 10.0
+_NAVIGATION_MAX_TOTAL_SECONDS = 120.0
+_NAVIGATION_BACKOFF_MULTIPLIER = 2
+_MILLISECONDS_PER_SECOND = 1_000
+
+
+@dataclass(frozen=True)
+class NavigationOptions:
+    """Validated navigation controls expressed in seconds."""
+
+    timeout_seconds: float
+    retry_count: int
+    retry_delay_seconds: float
+
+    @property
+    def timeout_milliseconds(self) -> float:
+        """Return the Playwright timeout value in milliseconds."""
+        return self.timeout_seconds * _MILLISECONDS_PER_SECOND
 
 
 # Parse CLI args: --script <path> (path provided by entrypoint from stdin)
@@ -315,32 +367,134 @@ async def _focus_active_tab(index: int, page: Any) -> None:
                 )
 
 
-async def get_active_page() -> Any:
-    """Get the currently active page, relaunching browser if it died."""
+async def _relaunch_for_empty_pool() -> Any:
+    """Relaunch the browser after its last tab closed and return the new page.
+
+    Closing the last tab (via close_tab or the site's own window.close())
+    leaves Camoufox running with no window, and the health probe still
+    passes. Each tab is its own OS window, so with none left Firefox refuses
+    new_page ("window is null") and only a relaunch recovers.
+    """
+    global _active_page
+    log.warning(
+        "no open tabs, relaunching the browser",
+        extra={"reason": "empty_page_pool"},
+    )
+    if not await browser.relaunch():
+        return None
+    page = await browser._get_page()
+    _setup_page_handlers(page)
+    _active_page = page
+    await _focus_active_tab(len(browser._context.pages) - 1, page)
+    return page
+
+
+async def get_active_page(open_if_empty: bool = True) -> Any:
+    """Get the currently active page, relaunching browser if it died.
+
+    When the browser is alive but every tab is closed, it is relaunched
+    unless open_if_empty is False, which read-only callers such as list_tabs
+    use to report the real pool. The screenshot and state routes run outside
+    _request_lock, so _page_heal_lock keeps concurrent callers from each
+    starting a relaunch.
+    """
     global _active_page
     if not browser:
         return None
-    # Heal a dead/crashed Camoufox before reading the context. Without this,
-    # the cached _active_page survives across browser deaths and every
-    # subsequent action fails with "Connection closed while reading from
-    # the driver" until the container is manually restarted.
-    if not await browser.ensure_healthy():
-        return None
-    if not browser._context:
-        return None
-    pages = browser._context.pages
-    if not pages:
-        _active_page = None
-        return None
-    # The cached _active_page may belong to the previous (dead) context.
-    # Drop it if it's not in the current page list.
-    if _active_page is None or _active_page not in pages:
-        _active_page = pages[-1]
-    return _active_page
+    async with _page_heal_lock:
+        # Heal a dead/crashed Camoufox before reading the context. Without
+        # this, the cached _active_page survives across browser deaths and
+        # every subsequent action fails with "Connection closed while reading
+        # from the driver" until the container is manually restarted.
+        if not await browser.ensure_healthy():
+            return None
+        if not browser._context:
+            return None
+        pages = browser._context.pages
+        if not pages:
+            _active_page = None
+            if not open_if_empty:
+                return None
+            return await _relaunch_for_empty_pool()
+        # The cached _active_page may belong to the previous (dead) context.
+        # Drop it if it's not in the current page list.
+        if _active_page is None or _active_page not in pages:
+            _active_page = pages[-1]
+        return _active_page
 
 
-async def _navigate(page: Any, url: str, **goto_kwargs: Any) -> None:
-    """Navigate, retrying once if Firefox is still settling after recovery."""
+def _navigation_number(
+    command: dict[str, Any],
+    field: str,
+    default: float,
+    minimum: float,
+    maximum: float,
+) -> float:
+    """Read one finite, bounded navigation control from an action command."""
+    value = command.get(field, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} must be a number")
+
+    parsed_value = float(value)
+    if not math.isfinite(parsed_value):
+        raise ValueError(f"{field} must be finite")
+    if parsed_value < minimum or parsed_value > maximum:
+        raise ValueError(f"{field} must be between {minimum} and {maximum}")
+    return parsed_value
+
+
+def _navigation_options(command: dict[str, Any]) -> NavigationOptions:
+    """Build bounded, explicit navigation controls for one action command."""
+    timeout_seconds = _navigation_number(
+        command,
+        "timeout",
+        NAVIGATION_TIMEOUT_DEFAULT_SECONDS,
+        _NAVIGATION_MIN_TIMEOUT_SECONDS,
+        _NAVIGATION_MAX_TIMEOUT_SECONDS,
+    )
+    retry_delay_seconds = _navigation_number(
+        command,
+        "retry_delay",
+        NAVIGATION_RETRY_DELAY_DEFAULT_SECONDS,
+        _NAVIGATION_MIN_RETRY_DELAY_SECONDS,
+        _NAVIGATION_MAX_RETRY_DELAY_SECONDS,
+    )
+    retry_count = command.get("retry_count", NAVIGATION_RETRY_COUNT_DEFAULT)
+    if isinstance(retry_count, bool) or not isinstance(retry_count, int):
+        raise ValueError("retry_count must be an integer")
+    if (
+        retry_count < _NAVIGATION_MIN_RETRY_COUNT
+        or retry_count > _NAVIGATION_MAX_RETRY_COUNT
+    ):
+        raise ValueError(
+            "retry_count must be between "
+            f"{_NAVIGATION_MIN_RETRY_COUNT} and {_NAVIGATION_MAX_RETRY_COUNT}"
+        )
+
+    retry_wait_seconds = retry_delay_seconds * (
+        _NAVIGATION_BACKOFF_MULTIPLIER**retry_count - 1
+    )
+    worst_case_seconds = timeout_seconds * (retry_count + 1) + retry_wait_seconds
+    if worst_case_seconds > _NAVIGATION_MAX_TOTAL_SECONDS:
+        raise ValueError(
+            "timeout, retry_count, and retry_delay exceed the "
+            f"{_NAVIGATION_MAX_TOTAL_SECONDS}-second navigation budget"
+        )
+
+    return NavigationOptions(
+        timeout_seconds=timeout_seconds,
+        retry_count=retry_count,
+        retry_delay_seconds=retry_delay_seconds,
+    )
+
+
+async def _navigate_once(
+    page: Any,
+    url: str,
+    navigation_options: NavigationOptions,
+    **goto_kwargs: Any,
+) -> None:
+    """Navigate once, retaining Firefox's interrupted-navigation recovery."""
     try:
         await page.goto(url, **goto_kwargs)
     except Exception as error:
@@ -348,49 +502,51 @@ async def _navigate(page: Any, url: str, **goto_kwargs: Any) -> None:
             raise
 
         log.warning("navigation interrupted while page was settling; retrying")
-        await page.wait_for_load_state("domcontentloaded")
+        await page.wait_for_load_state(
+            "domcontentloaded",
+            timeout=navigation_options.timeout_milliseconds,
+        )
         await page.goto(url, **goto_kwargs)
 
 
+async def _navigate(
+    page: Any,
+    url: str,
+    navigation_options: NavigationOptions,
+    **goto_kwargs: Any,
+) -> None:
+    """Navigate with explicit timeout and bounded timeout retries."""
+    goto_kwargs["timeout"] = navigation_options.timeout_milliseconds
+    for retry_index in range(navigation_options.retry_count + 1):
+        try:
+            await _navigate_once(page, url, navigation_options, **goto_kwargs)
+            return
+        except PlaywrightTimeoutError:
+            if retry_index == navigation_options.retry_count:
+                raise
+
+            retry_delay_seconds = navigation_options.retry_delay_seconds * (
+                _NAVIGATION_BACKOFF_MULTIPLIER**retry_index
+            )
+            log.warning(
+                "navigation timed out; retrying",
+                extra={
+                    "retry_index": retry_index + 1,
+                    "retry_delay_seconds": retry_delay_seconds,
+                },
+            )
+            if retry_delay_seconds:
+                await asyncio.sleep(retry_delay_seconds)
+
+
 async def get_window_offset_js(page) -> dict:
-    """Get browser content area offset from screen origin.
+    """Get the browser content area offset from the screen origin.
 
-    Uses Firefox's mozInnerScreenX/Y which report the real screen position
-    of the viewport. These are NOT spoofed by Camoufox (unlike outerHeight/
-    innerHeight which are fingerprint-spoofed and give wrong offsets).
-
-    On failure (page closed, JS context destroyed, mozInnerScreen missing
-    on a future Firefox), logs a warning and returns (0, 0). The caller
-    has no way to distinguish "valid (0,0) on a fullscreen window" from
-    "calibrate failed" — the log line is the only signal.
+    Falls back to (0, 0) when the offset cannot be read; the warning logged
+    by input_actions.read_window_offset is the only signal of that.
     """
-    try:
-        result = await page.evaluate("""() => ({
-                x: Math.round(window.mozInnerScreenX),
-                y: Math.round(window.mozInnerScreenY)
-            })""")
-    except Exception as e:
-        log.warning(
-            "calibrate failed (mozInnerScreen unreachable): %s — "
-            "returning (0, 0); coordinate translation will be wrong "
-            "until calibrate succeeds",
-            e,
-        )
-        return {"x": 0, "y": 0}
-
-    # Defensive sanity check — non-numeric / None means Firefox returned
-    # something unexpected (Camoufox change, future Firefox version). Treat
-    # the same as an exception: log loudly, fall back to (0, 0).
-    x = result.get("x") if isinstance(result, dict) else None
-    y = result.get("y") if isinstance(result, dict) else None
-    if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
-        log.warning(
-            "calibrate returned non-numeric offset %r — falling back to "
-            "(0, 0); coordinate translation will be wrong",
-            result,
-        )
-        return {"x": 0, "y": 0}
-    return {"x": int(x), "y": int(y)}
+    offset = await input_actions.read_window_offset(page)
+    return offset if offset is not None else {"x": 0, "y": 0}
 
 
 def make_response(
@@ -430,25 +586,37 @@ async def dispatch_action(cmd: dict) -> dict:
         await asyncio.sleep(float(duration))
         return make_response(True, {"slept": duration})
 
+    if action == "set_clipboard":
+        if "text" not in cmd:
+            return make_response(False, error="text required")
+        text = cmd["text"]
+        if not isinstance(text, str):
+            return make_response(False, error="text must be a string")
+        try:
+            return make_response(True, await clipboard.set_text(text))
+        except ClipboardError as error:
+            return make_response(False, error=str(error))
+
+    if action == "get_clipboard":
+        try:
+            return make_response(True, await clipboard.get_text())
+        except ClipboardError as error:
+            return make_response(False, error=str(error))
+
     if action == "start_recording":
         mode = cmd.get("mode", "window")
         fps = int(cmd.get("fps", 15))
         show_cursor = bool(cmd.get("show_cursor", True))
-        # viewport mode crops to the page content area — use the calibrated
-        # window_offset rather than a hardcoded chrome height. window/desktop
-        # capture from (0, 0) so they include the full browser frame.
+        # viewport mode crops to the page content area at its current screen
+        # position, re-measured now because fullscreen and tab windows move
+        # it. window/desktop capture from (0, 0) to include the browser frame.
         if mode == "viewport":
+            active = await get_active_page()
+            fresh = await input_actions.read_window_offset(active) if active else None
+            if fresh is not None:
+                system.window_offset = fresh
             offset_x = int(system.window_offset.get("x", 0))
             offset_y = int(system.window_offset.get("y", 0))
-            if offset_x == 0 and offset_y == 0:
-                # Re-calibrate on demand if it's never been done OR returned
-                # zero (likely a failed calibrate that got swallowed).
-                active = await get_active_page()
-                if active is not None:
-                    fresh = await get_window_offset_js(active)
-                    system.window_offset = fresh
-                    offset_x = int(fresh.get("x", 0))
-                    offset_y = int(fresh.get("y", 0))
         else:
             offset_x = 0
             offset_y = 0
@@ -571,7 +739,7 @@ async def dispatch_action(cmd: dict) -> dict:
     if action == "list_tabs":
         pages = browser._context.pages if browser and browser._context else []
         tabs = []
-        active = await get_active_page()
+        active = await get_active_page(open_if_empty=False)
         for i, p in enumerate(pages):
             tabs.append({"index": i, "url": p.url, "active": p is active})
         return make_response(True, {"tabs": tabs, "count": len(tabs)})
@@ -579,20 +747,31 @@ async def dispatch_action(cmd: dict) -> dict:
     if action == "new_tab":
         if not browser or not browser._context:
             return make_response(False, error="No browser context")
-        new_page = await browser._context.new_page()
-        _setup_page_handlers(new_page)
-        _active_page = new_page
-        # Foreground the new tab's window so it's what Xvfb renders
-        # (screenshots, recordings, VNC). See Browser.focus_tab_window —
-        # Firefox opens each page as its own OS window and bring_to_front()
-        # doesn't raise it. The new page is always the last one; it's still
-        # blank here (navigation happens below) so the focus click is safe.
-        await _focus_active_tab(len(browser._context.pages) - 1, new_page)
+        if browser._context.pages:
+            new_page = await browser._context.new_page()
+            _setup_page_handlers(new_page)
+            # Applied here as well as by the context `page` handler, so the
+            # tab is already in the scheme when it navigates below.
+            await browser.apply_color_scheme(new_page)
+            _active_page = new_page
+            # Foreground the new tab's window so it's what Xvfb renders
+            # (screenshots, recordings, VNC). See Browser.focus_tab_window.
+            # Firefox opens each page as its own OS window and bring_to_front()
+            # doesn't raise it. The new page is always the last one; it's still
+            # blank here (navigation happens below) so the focus click is safe.
+            await _focus_active_tab(len(browser._context.pages) - 1, new_page)
+        else:
+            # With no window left Firefox refuses new_page, so the relaunch in
+            # get_active_page opens, sets up, and focuses the tab instead.
+            new_page = await get_active_page()
+            if new_page is None:
+                return make_response(False, error="No active page")
         tab_url: str | None = cmd.get("url")
         if tab_url:
             await _navigate(
                 new_page,
                 tab_url,
+                _navigation_options(cmd),
                 wait_until=cmd.get("wait_until", "domcontentloaded"),
             )
         return make_response(
@@ -813,12 +992,13 @@ async def dispatch_action(cmd: dict) -> dict:
                 log.info(f"Loader matched: {loader.name}")
                 return await execute_loader(loader, url)
 
+        navigation_options = _navigation_options(cmd)
         goto_kwargs: dict[str, Any] = {
             "wait_until": cmd.get("wait_until", "domcontentloaded"),
         }
         if cmd.get("referer"):
             goto_kwargs["referer"] = cmd["referer"]
-        await _navigate(page, url, **goto_kwargs)
+        await _navigate(page, url, navigation_options, **goto_kwargs)
         return make_response(True, {"url": page.url, "title": await page.title()})
 
     if action == "refresh":
@@ -827,6 +1007,7 @@ async def dispatch_action(cmd: dict) -> dict:
         await _navigate(
             page,
             page.url,
+            _navigation_options(cmd),
             wait_until=cmd.get("wait_until", "domcontentloaded"),
         )
         return make_response(True, {"url": page.url, "title": await page.title()})
@@ -839,37 +1020,12 @@ async def dispatch_action(cmd: dict) -> dict:
         await asyncio.sleep(0.5)
         return make_response(True, {"clicked": selector})
 
-    if action == "mouse_move":
-        x, y = cmd.get("x"), cmd.get("y")
-        if x is None or y is None:
-            return make_response(False, error="x,y required")
-        system.move_mouse(int(x), int(y), cmd.get("duration"))
-        return make_response(True, {"moved_to": {"x": x, "y": y}})
-
-    if action == "mouse_click":
-        x, y = cmd.get("x"), cmd.get("y")
-        system.click(int(x) if x else None, int(y) if y else None)
-        if x is None or y is None:
-            return make_response(True, {"clicked_at": "current"})
-        return make_response(True, {"clicked_at": {"x": x, "y": y}})
-
-    if action == "system_click":
-        x, y = cmd.get("x"), cmd.get("y")
-        if x is None or y is None:
-            return make_response(False, error="x,y required")
-        system.move_mouse(int(x), int(y), cmd.get("duration"))
-        system.click()
-        return make_response(True, {"system_clicked": {"x": x, "y": y}})
-
-    if action == "scroll":
-        amount = cmd.get("amount", -3)
-        x, y = cmd.get("x"), cmd.get("y")
-        system.scroll(
-            int(amount),
-            int(x) if x is not None else None,
-            int(y) if y is not None else None,
-        )
-        return make_response(True, {"scrolled": amount})
+    if action in input_actions.ACTIONS:
+        try:
+            data = await input_actions.ACTIONS[action](cmd, page, system)
+        except input_actions.InputActionError as e:
+            return make_response(False, error=str(e))
+        return make_response(True, data)
 
     if action == "scroll_to_bottom":
         delay = cmd.get("delay", 0.4)
@@ -885,56 +1041,37 @@ async def dispatch_action(cmd: dict) -> dict:
         }})()""")
         return make_response(True, {"scrolled": "bottom"})
 
-    if action == "scroll_to_bottom_humanized":
-        min_clicks = int(cmd.get("min_clicks", 2))
-        max_clicks = int(cmd.get("max_clicks", 6))
-        delay = float(cmd.get("delay", 0.5))
-        while True:
-            prev = await page.evaluate("window.scrollY")
-            clicks = random.randint(min_clicks, max_clicks)
-            system.scroll(-clicks)
-            jittered = delay * random.uniform(0.7, 1.3)
-            await asyncio.sleep(jittered)
-            curr = await page.evaluate("window.scrollY")
-            if curr == prev:
-                break
-        await page.evaluate("window.scrollTo(0, 0)")
-        return make_response(True, {"scrolled": "bottom_humanized"})
-
     if action == "calibrate":
         system.window_offset = await get_window_offset_js(page)
         return make_response(True, {"window_offset": system.window_offset})
 
+    # Fullscreen is requested from the page's own world, as a page would.
     if action == "enter_fullscreen":
         is_fullscreen = await page.evaluate("!!document.fullscreenElement")
         if not is_fullscreen:
-            await page.evaluate("document.documentElement.requestFullscreen()")
+            await page.evaluate(
+                MAIN_WORLD_PREFIX + "document.documentElement.requestFullscreen()"
+            )
         return make_response(True, {"fullscreen": True, "changed": not is_fullscreen})
 
     if action == "exit_fullscreen":
         is_fullscreen = await page.evaluate("!!document.fullscreenElement")
         if is_fullscreen:
-            await page.evaluate("document.exitFullscreen()")
+            await page.evaluate(MAIN_WORLD_PREFIX + "document.exitFullscreen()")
         return make_response(True, {"fullscreen": False, "changed": is_fullscreen})
 
     if action == "get_resolution":
         result = system.get_resolution()
         return make_response(True, result)
 
-    if action == "system_type":
-        text = cmd.get("text", "")
-        interval = cmd.get("interval", 0.08)
-        if not text:
-            return make_response(False, error="No text")
-        system.system_type(text, interval)
-        return make_response(True, {"typed_len": len(text)})
-
-    if action == "send_key":
-        key = cmd.get("key", "")
-        if not key:
-            return make_response(False, error="No key")
-        system.send_key(key)
-        return make_response(True, {"send_key": key})
+    if action == "set_color_scheme":
+        assert browser is not None
+        try:
+            pages = await browser.set_color_scheme(cmd.get("scheme", ""))
+        except ValueError:
+            allowed = ", ".join((*COLOR_SCHEMES, COLOR_SCHEME_DEFAULT))
+            return make_response(False, error=f"scheme must be one of: {allowed}")
+        return make_response(True, {"scheme": browser.color_scheme, "pages": pages})
 
     if action == "fill":
         selector, value = cmd.get("selector", ""), cmd.get("value", "")
@@ -950,6 +1087,14 @@ async def dispatch_action(cmd: dict) -> dict:
 
     if action == "eval":
         expr = cmd.get("expression", "")
+        world = cmd.get("world", EVAL_WORLD_PAGE)
+        if world not in EVAL_WORLDS:
+            return make_response(
+                False,
+                error=f"world must be one of: {', '.join(EVAL_WORLDS)}",
+            )
+        if world == EVAL_WORLD_PAGE:
+            expr = MAIN_WORLD_PREFIX + expr
         result = await page.evaluate(expr)
         return make_response(True, {"result": result})
 
@@ -981,6 +1126,15 @@ async def dispatch_action(cmd: dict) -> dict:
             scroll: { x: scrollX, y: scrollY },
         })""")
         return make_response(True, info)
+
+    if action == "detect_challenge":
+        scroll_into_view = cmd.get("scroll_into_view", False)
+        if not isinstance(scroll_into_view, bool):
+            return make_response(False, error="scroll_into_view must be a boolean")
+        return make_response(
+            True,
+            await detect_challenges(page, scroll_into_view=scroll_into_view),
+        )
 
     if action == "get_element":
         selector = cmd.get("selector", "")

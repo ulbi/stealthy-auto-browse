@@ -8,6 +8,7 @@ import binascii
 import json
 import mimetypes
 import os
+import re
 import subprocess
 import tempfile
 import uuid
@@ -15,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse as _urlparse
+from xml.sax.saxutils import escape as _xml_escape
 
 from logger import get_logger
 
@@ -33,6 +35,153 @@ DEFAULT_USER_DATA_DIR = "/userdata"
 
 # Persisted browser properties file (stores Camoufox config, not raw fingerprint)
 BROWSER_PROPS_FILE = Path(DEFAULT_USER_DATA_DIR) / "stealthy-auto-browse-props.json"
+
+# prefers-color-scheme values pages can emulate. COLOR_SCHEME_DEFAULT turns
+# emulation off and pages see the browser's own value again.
+COLOR_SCHEMES = ("dark", "light", "no-preference")
+COLOR_SCHEME_DEFAULT = "default"
+# Playwright's emulate_media value that clears color-scheme emulation.
+_PLAYWRIGHT_CLEAR_EMULATION = "null"
+
+# Camoufox runs Playwright's evaluate calls and init scripts in an isolated
+# world that sees the DOM but not the page's own JavaScript. A script prefixed
+# with this runs in the page's world instead (needs main_world_eval=True).
+MAIN_WORLD_PREFIX = "mw:"
+
+_CAMOUFOX_TARGET_OS = "lin"
+_FINGERPRINT_OS = "linux"
+# Camoufox grants no user activation to evaluate calls, so enter_fullscreen's
+# requestFullscreen() would be refused. This lifts that one gesture check; it
+# does not mark the page as user-activated.
+_FIREFOX_PREFS = {"full-screen-api.allow-trusted-requests-only": False}
+_VIRTUAL_MEDIA_FIREFOX_PREFS = {
+    "media.captureStream.enabled": True,
+    "media.devices.insecure.enabled": True,
+    "media.getusermedia.insecure.enabled": True,
+}
+# Persisted identities name the Firefox they were generated for. These keys
+# carry that version and follow the installed browser after an upgrade.
+_FIREFOX_VERSION_KEYS = ("navigator.userAgent", "headers.User-Agent")
+_FIREFOX_VERSION_TOKENS = re.compile(r"(rv:|Firefox/)\d+\.0")
+_WEBGL_CONFIG_PREFIXES = ("webGl:", "webGl2:")
+# Identities generated before camoufox 0.5 carry these values. Stock Firefox
+# reports its own (DNT "unspecified", GPC false, the protocol's own
+# Accept-Encoding, a history length that grows as the tab navigates), and
+# Camoufox keeps any value already in the config, so they are dropped to let
+# the browser's real values show.
+_STOCK_DEFAULT_KEYS = (
+    "navigator.doNotTrack",
+    "navigator.globalPrivacyControl",
+    "headers.Accept-Encoding",
+    "window.history.length",
+)
+_WINDOW_GEOMETRY_KEYS = (
+    "window.outerWidth",
+    "window.outerHeight",
+    "window.innerWidth",
+    "window.innerHeight",
+    "window.screenX",
+    "window.screenY",
+)
+_CAMOUFOX_FONTCONFIG_RELATIVE_PATHS = (
+    Path("fontconfig/linux/fonts.conf"),
+    Path("fontconfigs/linux/fonts.conf"),
+)
+_CAMOUFOX_FONTCONFIG_DIRECTORY_MARKER = '<dir prefix="cwd">fonts</dir>'
+_CAMOUFOX_CONFIG_ENV_PREFIX = "CAMOU_CONFIG_"
+_CAMOUFOX_CANVAS_NOISE_KEYS = (
+    "canvas:aaCapOffset",
+    "canvas:aaOffset",
+)
+_LINUX_SYSTEM_FONT_DIRECTORIES = (
+    Path("/usr/share/fonts/truetype/dejavu"),
+    Path("/usr/share/fonts/truetype/liberation"),
+    Path("/usr/share/fonts/opentype/urw-base35"),
+)
+_LINUX_BROWSER_FONT_FAMILIES = frozenset(
+    {
+        "Arial",
+        "DejaVu Sans",
+        "DejaVu Sans Mono",
+        "DejaVu Serif",
+        "Liberation Mono",
+        "Liberation Sans",
+        "Liberation Serif",
+        "Nimbus Mono PS",
+        "Nimbus Roman",
+        "Nimbus Sans",
+        "Times New Roman",
+        "URW Bookman",
+        "URW Gothic",
+    }
+)
+_LINUX_CANVAS_FONT_ALIASES = {
+    "Arial": "Arimo",
+    "Times New Roman": "Arimo",
+}
+_CANVAS_CONTEXT_WARMUP_SCRIPT = r"""
+async () => {
+    if (typeof OffscreenCanvas !== "function" || typeof Worker !== "function") {
+        throw new Error("canvas worker APIs are unavailable");
+    }
+
+    const text = "warmup A \ud83d\ude00 \u4e2d \u30ab";
+    const draw = context => {
+        context.font = "14px 'Arial'";
+        context.fillText(text, 0, 12);
+        context.font = "18px 'Times New Roman'";
+        context.fillText(text, 0, 32);
+        context.getImageData(0, 0, 64, 40);
+    };
+    draw(new OffscreenCanvas(64, 40).getContext("2d"));
+
+    const workerSource = `
+        "use strict";
+        onmessage = event => {
+            const canvas = new OffscreenCanvas(64, 40);
+            const context = canvas.getContext("2d");
+            context.font = "14px 'Arial'";
+            context.fillText(event.data, 0, 12);
+            context.font = "18px 'Times New Roman'";
+            context.fillText(event.data, 0, 32);
+            context.getImageData(0, 0, 64, 40);
+            postMessage(true);
+        };
+    `;
+    const workerUrl = URL.createObjectURL(
+        new Blob([workerSource], {type: "text/javascript"}),
+    );
+    try {
+        await new Promise((resolve, reject) => {
+            const worker = new Worker(workerUrl);
+            const timeout = setTimeout(() => {
+                worker.terminate();
+                reject(new Error("canvas worker warmup timed out"));
+            }, 5000);
+            worker.onmessage = () => {
+                clearTimeout(timeout);
+                worker.terminate();
+                resolve();
+            };
+            worker.onerror = event => {
+                clearTimeout(timeout);
+                worker.terminate();
+                reject(new Error(event.message));
+            };
+            worker.postMessage(text);
+        });
+    } finally {
+        URL.revokeObjectURL(workerUrl);
+    }
+}
+"""
+_MOBILE_WEBGL_TEXTURE_EXTENSIONS = frozenset(
+    {
+        "WEBGL_compressed_texture_astc",
+        "WEBGL_compressed_texture_etc",
+        "WEBGL_compressed_texture_etc1",
+    }
+)
 
 VIRTUAL_MEDIA_DIR = Path(os.environ.get("VIRTUAL_MEDIA_DIR", "/media"))
 VIRTUAL_MEDIA_ORIGIN = "https://virtual-media.stealthy.invalid"
@@ -436,9 +585,10 @@ def _load_persisted_config() -> dict[str, Any] | None:
 
     try:
         with open(BROWSER_PROPS_FILE) as f:
-            return json.load(f)
+            config = json.load(f)
     except (json.JSONDecodeError, OSError):
         return None
+    return config if isinstance(config, dict) else None
 
 
 def _save_config(config: dict[str, Any]) -> None:
@@ -448,49 +598,138 @@ def _save_config(config: dict[str, Any]) -> None:
         json.dump(config, f, indent=2)
 
 
+def _drop_unknown_webgl_identity(config: dict[str, Any]) -> None:
+    """Forget a persisted GPU that Camoufox has no WebGL data for.
+
+    Camoufox rebuilds the WebGL parameters from the persisted vendor and
+    renderer and refuses a pair it has never recorded on Linux. Dropping the
+    pair lets it draw a new GPU that fits the rest of the identity.
+    """
+    from camoufox.webgl import firefox_gpus
+
+    gpu = (config.get("webGl:vendor"), config.get("webGl:renderer"))
+    if gpu == (None, None) or gpu in firefox_gpus(_CAMOUFOX_TARGET_OS):
+        return
+    log.warning(
+        "persisted WebGL GPU is unknown to Camoufox; drawing a new Linux GPU",
+        extra={"reason": "invalid_persisted_webgl_cohort"},
+    )
+    for key in tuple(config):
+        if key.startswith(_WEBGL_CONFIG_PREFIXES):
+            config.pop(key)
+
+
+def _drop_stock_default_overrides(config: dict[str, Any]) -> None:
+    """Remove persisted values that stock Firefox decides for itself."""
+    for key in _STOCK_DEFAULT_KEYS:
+        config.pop(key, None)
+
+
+def _align_firefox_version(config: dict[str, Any], firefox_major: str) -> None:
+    """Make a persisted User-Agent name the Firefox that is installed now."""
+    for key in _FIREFOX_VERSION_KEYS:
+        value = config.get(key)
+        if isinstance(value, str):
+            config[key] = _FIREFOX_VERSION_TOKENS.sub(
+                lambda match: f"{match.group(1)}{firefox_major}.0",
+                value,
+            )
+
+
+def _filter_mobile_webgl_extensions(config: dict[str, Any]) -> None:
+    """Remove mobile texture formats from both desktop WebGL contexts."""
+    for key in ("webGl:supportedExtensions", "webGl2:supportedExtensions"):
+        extensions = config.get(key)
+        if not isinstance(extensions, list):
+            continue
+        config[key] = [
+            extension
+            for extension in extensions
+            if extension not in _MOBILE_WEBGL_TEXTURE_EXTENSIONS
+        ]
+
+
+def _prepare_linux_font_families(config: dict[str, Any]) -> None:
+    """Expose installed Linux families and stable canvas compatibility aliases."""
+    configured_fonts = config.get("fonts", [])
+    if not isinstance(configured_fonts, list) or any(
+        not isinstance(font, str) for font in configured_fonts
+    ):
+        raise BrowserError("Camoufox font configuration is invalid")
+    config["fonts"] = sorted(
+        set(configured_fonts).union(_LINUX_BROWSER_FONT_FAMILIES)
+    )
+
+
+def _refresh_camoufox_environment(
+    config: dict[str, Any],
+    options: dict[str, Any],
+) -> None:
+    """Encode the finalized fingerprint after Camoufox mutates it."""
+    from camoufox.utils import get_env_vars
+
+    for key in _CAMOUFOX_CANVAS_NOISE_KEYS:
+        config.pop(key, None)
+    _filter_mobile_webgl_extensions(config)
+
+    environment = options.get("env")
+    if not isinstance(environment, dict):
+        raise BrowserError("Camoufox launch environment is invalid")
+    for key in tuple(environment):
+        if key.startswith(_CAMOUFOX_CONFIG_ENV_PREFIX):
+            environment.pop(key)
+    environment.update(get_env_vars(config, _CAMOUFOX_TARGET_OS))
+
+
 def _update_config_screen(config: dict[str, Any], width: int, height: int) -> None:
-    """Update screen/window dims in config to match current resolution."""
+    """Match the screen to the display and let the window report its real size.
+
+    The window's size and position come from the real browser window, which
+    _fit_window_to_screen keeps inside the display. Forcing them instead made
+    the claimed window disagree with the real toolbar height, and on Firefox
+    156 report an outer window taller than the screen.
+    """
     config["screen.width"] = width
     config["screen.height"] = height
     config["screen.availWidth"] = width
     config["screen.availHeight"] = height
-    config["window.outerWidth"] = width
-    config["window.outerHeight"] = height
-    config["window.innerWidth"] = width
-    config["window.innerHeight"] = height - 80  # Account for browser chrome
-    config["window.screenX"] = 0
-    config["window.screenY"] = 0
     config["screen.availLeft"] = 0
     config["screen.availTop"] = 0
+    for key in _WINDOW_GEOMETRY_KEYS:
+        config.pop(key, None)
 
 
-def _generate_camoufox_config(screen_width: int, screen_height: int) -> dict[str, Any]:
-    """Generate a Camoufox config with realistic Linux Firefox fingerprint."""
-    from browserforge.fingerprints import FingerprintGenerator
-    from camoufox.fingerprints import from_browserforge
-    from camoufox.pkgman import installed_verstr
+def _fit_window_to_screen(window_id: str, width: int, height: int) -> None:
+    """Size a browser window so it and its window-manager frame fit the screen.
 
-    # Generate without screen constraints so browserforge succeeds for any resolution.
-    # We override fp.screen.* values below to match our actual Xvfb display.
-    fp_gen = FingerprintGenerator(browser="firefox", os="linux")
-    fp = fp_gen.generate()
-
-    # Adjust screen/window to match our actual display
-    fp.screen.width = screen_width
-    fp.screen.height = screen_height
-    fp.screen.availWidth = screen_width
-    fp.screen.availHeight = screen_height
-    fp.screen.outerWidth = screen_width
-    fp.screen.outerHeight = screen_height
-    fp.screen.innerWidth = screen_width
-    fp.screen.innerHeight = screen_height - 80  # Account for browser chrome
-    fp.screen.screenX = 0
-    fp.screen.availTop = 0
-    fp.screen.availLeft = 0
-
-    # Convert to Camoufox config format
-    ff_version = installed_verstr().split(".", 1)[0]
-    return from_browserforge(fp, ff_version)
+    Openbox draws a title bar above the window and a border around it, so a
+    window sized to the full display hangs off the bottom of the screen.
+    """
+    result = subprocess.run(
+        ["xdotool", "getwindowgeometry", "--shell", window_id],
+        capture_output=True,
+        text=True,
+    )
+    geometry = dict(
+        line.split("=", 1) for line in result.stdout.splitlines() if "=" in line
+    )
+    try:
+        left, top = int(geometry["X"]), int(geometry["Y"])
+    except (KeyError, ValueError):
+        log.warning(
+            "browser window geometry is unreadable; sizing it to the full display",
+            extra={"reason": "window_geometry_unreadable", "stderr": result.stderr},
+        )
+        left = top = 0
+    subprocess.run(
+        [
+            "xdotool",
+            "windowsize",
+            window_id,
+            str(width - 2 * left),
+            str(height - top - left),
+        ]
+    )
 
 
 def _log_browser_postmortem() -> None:
@@ -608,12 +847,53 @@ class Browser:
         self._context: Any = None
         self._page: Any = None
         self._state = BrowserState()
+        self._fontconfig_directory: tempfile.TemporaryDirectory[str] | None = None
         self._redis_sync = RedisSync() if RedisSync else None
         self._virtual_media_sources: dict[str, Path | None] = {
             _VIRTUAL_MEDIA_CAMERA: self.config.virtual_camera_file,
             _VIRTUAL_MEDIA_MICROPHONE: self.config.virtual_microphone_file,
         }
         self._virtual_media_revision = 0
+        # Emulated prefers-color-scheme, or None for the browser's own value.
+        # Kept here so it survives a relaunch and reaches pages opened later.
+        self._color_scheme: str | None = None
+
+    @property
+    def color_scheme(self) -> str:
+        """The emulated prefers-color-scheme, or COLOR_SCHEME_DEFAULT."""
+        return self._color_scheme or COLOR_SCHEME_DEFAULT
+
+    async def set_color_scheme(self, scheme: str) -> int:
+        """Emulate prefers-color-scheme on every open page and every page
+        opened later. COLOR_SCHEME_DEFAULT turns emulation off. Returns the
+        number of open pages it was applied to."""
+        if scheme != COLOR_SCHEME_DEFAULT and scheme not in COLOR_SCHEMES:
+            raise ValueError(f"unknown color scheme: {scheme}")
+        self._color_scheme = None if scheme == COLOR_SCHEME_DEFAULT else scheme
+        if self._context is None:
+            return 0
+        pages = list(self._context.pages)
+        for page in pages:
+            await self.apply_color_scheme(page)
+        return len(pages)
+
+    async def apply_color_scheme(self, page: Any) -> None:
+        """Apply the current color scheme to one page."""
+        await page.emulate_media(
+            color_scheme=self._color_scheme or _PLAYWRIGHT_CLEAR_EMULATION
+        )
+
+    def _on_new_page_color_scheme(self, page: Any) -> None:
+        """Context `page` handler: give pages a site opens the same scheme."""
+        if self._color_scheme is None:
+            return
+        asyncio.ensure_future(self._apply_color_scheme_logged(page))
+
+    async def _apply_color_scheme_logged(self, page: Any) -> None:
+        try:
+            await self.apply_color_scheme(page)
+        except Exception as error:  # a page closed before it was set up is not fatal
+            log.warning("browser: could not apply color scheme to a new page: %s", error)
 
     @property
     def state(self) -> BrowserState:
@@ -658,7 +938,8 @@ class Browser:
         for page in self._context.pages:
             try:
                 await page.evaluate(
-                    """payload => {
+                    MAIN_WORLD_PREFIX
+                    + """payload => {
                         window.dispatchEvent(
                             new CustomEvent(payload.eventName, { detail: payload.state }),
                         );
@@ -909,6 +1190,14 @@ class Browser:
         # Crashes are usually OOM (Facebook etc. + accumulated persistent
         # profile state), but they can also be Firefox segfaults / asserts.
         _log_browser_postmortem()
+        return await self.relaunch()
+
+    async def relaunch(self) -> bool:
+        """Tear the browser down and start it again on the same profile.
+
+        Returns False if the new launch failed. Cookies and storage survive
+        because the context is persistent on disk.
+        """
         try:
             await self.stop()
         except Exception as e:
@@ -988,6 +1277,17 @@ class Browser:
 
         if self._redis_sync:
             await self._redis_sync.stop()
+
+        if self._fontconfig_directory:
+            try:
+                self._fontconfig_directory.cleanup()
+            except OSError as error:
+                log.warning(
+                    "runtime fontconfig cleanup failed",
+                    extra={"reason": "fontconfig_cleanup_failed"},
+                    exc_info=error,
+                )
+            self._fontconfig_directory = None
 
         self._state = BrowserState()
 
@@ -1108,23 +1408,28 @@ class Browser:
 
     async def _launch_browser(self) -> None:
         """Launch Camoufox with proper C++ level fingerprint injection."""
-        from browserforge.fingerprints import Screen
+        from camoufox.addons import DefaultAddons
+        from camoufox.fingerprints import Screen
+        from camoufox.pkgman import installed_verstr
         from camoufox.utils import launch_options
         from playwright.async_api import async_playwright
-
-        self._playwright = await async_playwright().start()
 
         # Get window size from XVFB_RESOLUTION
         width, height = _get_default_viewport()
 
-        # Load or generate Camoufox config
+        # A persisted identity keeps every value it already has. Without one,
+        # Camoufox generates a full Linux identity during launch_options and
+        # the result is persisted below.
         config = _load_persisted_config()
-        if config is None:
-            config = _generate_camoufox_config(width, height)
+        is_new_identity = not config
+        if is_new_identity:
+            config = {}
         else:
-            # Update screen dimensions to match current XVFB_RESOLUTION
             _update_config_screen(config, width, height)
-        _save_config(config)
+            _align_firefox_version(config, installed_verstr().split(".", 1)[0])
+            _drop_stock_default_overrides(config)
+            _prepare_linux_font_families(config)
+            _drop_unknown_webgl_identity(config)
 
         # Use system locale or default to en-US
         locale = os.environ.get("LANG", "en_US.UTF-8").split(".")[0].replace("_", "-")
@@ -1134,12 +1439,13 @@ class Browser:
         # Get timezone from TZ env var (set via docker -e TZ=Europe/Bucharest)
         timezone_id = os.environ.get("TZ")
 
+        self._playwright = await async_playwright().start()
         try:
             # Build launch options with proper fingerprint injection
             # This generates env vars with CAMOU_CONFIG_* for C++ level spoofing
-            # Use permissive screen constraints so browserforge's internal
-            # fingerprint generation doesn't fail for small Xvfb resolutions.
-            # Our persisted config values take precedence via merge_into.
+            # Permissive screen constraints keep generation working for small
+            # Xvfb resolutions; the real display size is applied afterwards.
+            # Values already in config take precedence via merge_into.
             screen = Screen(
                 min_width=1024,
                 max_width=1920,
@@ -1147,14 +1453,35 @@ class Browser:
                 max_height=1080,
             )
             opts = launch_options(
-                config=config,  # Pass our persisted config directly
+                config=config,
                 screen=screen,
-                os="linux",
+                os=_FINGERPRINT_OS,
                 headless=False,
                 locale=locale,
                 humanize=True,  # Human-like mouse movement
+                # Allows MAIN_WORLD_PREFIX scripts; nothing runs in the page's
+                # world unless a call asks for it.
+                main_world_eval=True,
+                firefox_user_prefs=dict(_FIREFOX_PREFS),
                 i_know_what_im_doing=True,  # We're using our persisted config
+                # uBlock Origin ships via distribution/policies.json
+                # (scripts/install_extensions.py). Camoufox's own default-addon
+                # download leaves an empty addons/UBO cache dir behind on a failed
+                # fetch and never re-validates it, so every later launch raises
+                # InvalidAddonPath and crash-loops the browser. Exclude it here so
+                # that cache path can never poison startup.
+                exclude_addons=[DefaultAddons.UBO],
             )
+            # launch_options fills every key missing from config from a fresh
+            # random fingerprint, so the released window geometry and stock
+            # defaults are removed again after it.
+            _update_config_screen(config, width, height)
+            _drop_stock_default_overrides(config)
+            if is_new_identity:
+                _prepare_linux_font_families(config)
+            _refresh_camoufox_environment(config, opts)
+            self._configure_runtime_fontconfig(opts)
+            _save_config(config)
 
             # Add persistent context settings
             opts["user_data_dir"] = DEFAULT_USER_DATA_DIR
@@ -1190,17 +1517,20 @@ class Browser:
                 or self.config.virtual_camera_file
                 or self.config.virtual_microphone_file
             ):
-                opts["firefox_user_prefs"] = {
-                    "media.captureStream.enabled": True,
-                    "media.devices.insecure.enabled": True,
-                    "media.getusermedia.insecure.enabled": True,
-                }
+                # Added to launch_options' prefs, which carry identity
+                # settings (scrollbars, locale, WebGL) that must not be lost.
+                opts["firefox_user_prefs"].update(_VIRTUAL_MEDIA_FIREFOX_PREFS)
 
             self._context = await self._playwright.firefox.launch_persistent_context(
                 **opts
             )
             self._browser = self._context
             await self._configure_virtual_media()
+            await self._warm_up_canvas_contexts()
+            self._context.on("page", self._on_new_page_color_scheme)
+            if self._color_scheme is not None:
+                for open_page in self._context.pages:
+                    await self.apply_color_scheme(open_page)
 
             # Crash diagnostics — Playwright fires these events when the
             # browser / page processes die. Without them the only signal is
@@ -1231,7 +1561,7 @@ class Browser:
                 if not wid:
                     continue
                 subprocess.run(["xdotool", "windowmove", wid, "0", "0"])
-                subprocess.run(["xdotool", "windowsize", wid, str(width), str(height)])
+                _fit_window_to_screen(wid, width, height)
 
             # Grant Firefox content widget initial keyboard focus.
             # Under Openbox, a freshly mapped Firefox window gives X focus to
@@ -1246,7 +1576,94 @@ class Browser:
             subprocess.run(["xdotool", "click", "1"])
         except Exception as e:
             await self.stop()
-            raise BrowserError(f"Failed to launch browser: {e}")
+            raise BrowserError(f"Failed to launch browser: {e}") from e
+
+    async def _warm_up_canvas_contexts(self) -> None:
+        """Initialize main and worker canvas font fallback before readiness."""
+        if not self._context:
+            raise BrowserError("browser context is unavailable for canvas warmup")
+        pages = self._context.pages
+        page = pages[0] if pages else await self._context.new_page()
+        try:
+            await page.evaluate(_CANVAS_CONTEXT_WARMUP_SCRIPT)
+        except Exception as error:
+            raise BrowserError("canvas context warmup failed") from error
+
+    def _configure_runtime_fontconfig(self, options: dict[str, Any]) -> None:
+        """Point fontconfig at Camoufox's bundled Linux fonts and aliases."""
+        executable_path = options.get("executable_path")
+        if not isinstance(executable_path, str) or not executable_path:
+            raise BrowserError("Camoufox launch options have no executable path")
+
+        browser_root = Path(executable_path).parent
+        fonts_directory = browser_root / "fonts"
+        if not fonts_directory.is_dir():
+            raise BrowserError("Camoufox bundled fonts directory is missing")
+        missing_directories = [
+            directory
+            for directory in _LINUX_SYSTEM_FONT_DIRECTORIES
+            if not directory.is_dir()
+        ]
+        if missing_directories:
+            raise BrowserError("required Linux system font directory is missing")
+
+        source_path = next(
+            (
+                browser_root / relative_path
+                for relative_path in _CAMOUFOX_FONTCONFIG_RELATIVE_PATHS
+                if (browser_root / relative_path).is_file()
+            ),
+            None,
+        )
+        if source_path is None:
+            raise BrowserError("Camoufox Linux fonts.conf is missing")
+
+        try:
+            source = source_path.read_text(encoding="utf-8")
+        except OSError as error:
+            raise BrowserError("Camoufox Linux fonts.conf could not be read") from error
+        if _CAMOUFOX_FONTCONFIG_DIRECTORY_MARKER not in source:
+            raise BrowserError("Camoufox Linux fonts.conf has an unsupported layout")
+
+        environment = options.setdefault("env", {})
+        if not isinstance(environment, dict):
+            raise BrowserError("Camoufox launch environment is invalid")
+        if self._fontconfig_directory:
+            self._fontconfig_directory.cleanup()
+        self._fontconfig_directory = tempfile.TemporaryDirectory(
+            prefix="stealthy-fontconfig-"
+        )
+        runtime_path = Path(self._fontconfig_directory.name) / "fonts.conf"
+        font_directories = (fonts_directory, *_LINUX_SYSTEM_FONT_DIRECTORIES)
+        directory_entries = "\n".join(
+            f"<dir>{_xml_escape(str(directory.resolve()))}</dir>"
+            for directory in font_directories
+        )
+        alias_entries = "\n".join(
+            (
+                '<match target="pattern">'
+                '<test name="family" compare="eq">'
+                f"<string>{_xml_escape(source_family)}</string>"
+                "</test>"
+                '<edit name="family" mode="assign" binding="strong">'
+                f"<string>{_xml_escape(target_family)}</string>"
+                "</edit>"
+                "</match>"
+            )
+            for source_family, target_family in _LINUX_CANVAS_FONT_ALIASES.items()
+        )
+        runtime_source = source.replace(
+            _CAMOUFOX_FONTCONFIG_DIRECTORY_MARKER,
+            f"{directory_entries}\n{alias_entries}",
+            1,
+        )
+        try:
+            runtime_path.write_text(runtime_source, encoding="utf-8")
+        except OSError as error:
+            raise BrowserError("runtime fontconfig could not be written") from error
+
+        environment.pop("FONTCONFIG_PATH", None)
+        environment["FONTCONFIG_FILE"] = str(runtime_path)
 
     async def _configure_virtual_media(self) -> None:
         """Install file-backed getUserMedia streams before page navigation."""
@@ -1314,8 +1731,13 @@ class Browser:
             "initialState": self.virtual_media_state(),
             "changeEvent": _VIRTUAL_MEDIA_CHANGE_EVENT,
         }
+        # The override must replace getUserMedia where the page calls it, so
+        # it runs in the page's world, not Camoufox's isolated one.
         await self._context.add_init_script(
-            script=f"({_VIRTUAL_MEDIA_INIT_SCRIPT})({json.dumps(init_config)});",
+            script=(
+                f"{MAIN_WORLD_PREFIX}"
+                f"({_VIRTUAL_MEDIA_INIT_SCRIPT})({json.dumps(init_config)});"
+            ),
         )
         log.info("virtual media configured", extra=self.virtual_media_state())
 

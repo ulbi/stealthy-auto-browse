@@ -10,7 +10,7 @@ _script_run() {
         -e TEST_URL="$TEST_PAGE" \
         "$@" \
         "$IMAGE_NAME:$TEST_TAG" --script \
-        2>/dev/null < "$SCRIPT_FIXTURES/$script_name"
+        2>/dev/null <"$SCRIPT_FIXTURES/$script_name"
 }
 
 test_script_basic() {
@@ -113,14 +113,14 @@ test_script_save_to_file() {
 }
 
 test_script_exit_code_success() {
-    _script_run basic.yaml > /dev/null
+    _script_run basic.yaml >/dev/null
     local code=$?
     assert_eq "$code" "0" "script_exit_code_success: exit 0" || return 1
     echo "OK: script_exit_code_success (exit code 0)"
 }
 
 test_script_exit_code_failure() {
-    _script_run on_error_stop.yaml > /dev/null
+    _script_run on_error_stop.yaml >/dev/null
     local code=$?
     assert_eq "$code" "1" "script_exit_code_failure: exit 1" || return 1
     echo "OK: script_exit_code_failure (exit code 1)"
@@ -298,7 +298,7 @@ test_script_loaders() {
         -e TEST_URL="$TEST_PAGE" \
         -v "$WORKDIR/tests/fixtures/loaders:/loaders:ro" \
         "$IMAGE_NAME:$TEST_TAG" --script \
-        2>/dev/null < "$SCRIPT_FIXTURES/loaders_work.yaml")
+        2>/dev/null <"$SCRIPT_FIXTURES/loaders_work.yaml")
 
     if [ -z "$out" ]; then
         echo "  FAIL: script_loaders: no output"
@@ -325,6 +325,16 @@ test_script_runner_unit() {
         "$IMAGE_NAME:$TEST_TAG" \
         /tests/test_script_runner.py || return 1
     echo "OK: script_runner_unit (validation and control-flow semantics)"
+}
+
+test_challenge_detector_unit() {
+    docker run --rm \
+        -e PYTHONDONTWRITEBYTECODE=1 \
+        -v "$WORKDIR/tests/test_challenge_detector.py:/tests/test_challenge_detector.py:ro" \
+        --entrypoint python \
+        "$IMAGE_NAME:$TEST_TAG" \
+        /tests/test_challenge_detector.py || return 1
+    echo "OK: challenge_detector_unit (signal matching, redaction, and failures)"
 }
 
 test_script_control_flow() {
@@ -362,6 +372,83 @@ assert len(result["step_results"][7]["data"]["iterations"]) == 2
     echo "OK: script_control_flow (all condition types, branches, repeat, while)"
 }
 
+test_script_challenge_detection() {
+    local out
+    out=$(_script_run challenge_detection.yaml)
+    if [ -z "$out" ]; then
+        echo "  FAIL: script_challenge_detection: no output"
+        return 1
+    fi
+
+    echo "$out" | python3 -c '
+import json
+import sys
+
+result = json.load(sys.stdin)
+assert result["success"] is True
+assert result["outputs"]["challenge"]["detected"] is True
+assert result["outputs"]["challenge"]["status"] == "present"
+assert result["outputs"]["challenge"]["scrolled_into_view"] is True
+assert result["outputs"]["challenge_in_viewport"]["result"] is True
+assert {match["vendor"] for match in result["outputs"]["challenge"]["matches"]} == {
+    "altcha", "arkose", "aws_waf", "friendlycaptcha", "geetest", "hcaptcha",
+    "recaptcha", "turnstile", "unknown",
+}
+assert "TEST_PUBLIC_KEY_DO_NOT_USE" not in json.dumps(result)
+assert result["outputs"]["decision"]["result"] == "human-review-needed"
+' || {
+        echo "  FAIL: script_challenge_detection: unexpected result"
+        return 1
+    }
+
+    echo "OK: script_challenge_detection (detector scrolls documented catalogue into view)"
+}
+
+test_script_fingerprint_consistency() {
+    local out
+    out=$(_script_run fingerprint_consistency.yaml)
+    if [ -z "$out" ]; then
+        echo "  FAIL: script_fingerprint_consistency: no output"
+        return 1
+    fi
+
+    echo "$out" | python3 -c '
+import json
+import sys
+
+result = json.load(sys.stdin)
+assert result["success"] is True
+fingerprint = result["outputs"]["fingerprint"]["result"]
+assert len({round(width, 3) for width in fingerprint["widths"].values()}) == 3
+assert fingerprint["webgl"]["vendor"]
+assert fingerprint["webgl"]["renderer"]
+mobile_extensions = {
+    "WEBGL_compressed_texture_astc",
+    "WEBGL_compressed_texture_etc",
+    "WEBGL_compressed_texture_etc1",
+}
+assert mobile_extensions.isdisjoint(fingerprint["webgl"]["extensions"])
+' || {
+        echo "  FAIL: script_fingerprint_consistency: inconsistent surface"
+        return 1
+    }
+
+    echo "OK: script_fingerprint_consistency (font and WebGL surfaces agree)"
+}
+
+test_script_clipboard() {
+    local out actual
+    out=$(_script_run clipboard.yaml)
+    if [[ -z "$out" ]]; then
+        echo "  FAIL: script_clipboard: no output"
+        return 1
+    fi
+
+    actual=$(echo "$out" | json_get "['outputs']['clipboard']['text']")
+    assert_eq "$actual" "script clipboard λ" "script_clipboard: exact text" || return 1
+    echo "OK: script_clipboard"
+}
+
 ALL_TESTS+=(
     test_script_basic
     test_script_on_error_continue
@@ -377,5 +464,9 @@ ALL_TESTS+=(
     test_script_multi_action
     test_script_loaders
     test_script_runner_unit
+    test_challenge_detector_unit
     test_script_control_flow
+    test_script_challenge_detection
+    test_script_fingerprint_consistency
+    test_script_clipboard
 )

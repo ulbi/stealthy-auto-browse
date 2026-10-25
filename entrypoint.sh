@@ -9,8 +9,10 @@ _fix_perms() {
     for dir in /userdata /loaders /recordings; do
         [ -d "$dir" ] || continue
 
-        # Skip if already correct
-        if [ "$(stat -c '%u:%g' "$dir")" = "$TARGET_UID:$TARGET_GID" ]; then
+        # Skip only when nothing inside belongs to someone else. Checking the
+        # directory alone missed files copied in by another user, such as a
+        # saved profile, which the browser then could not rewrite.
+        if [ -z "$(find "$dir" \( ! -user "$TARGET_UID" -o ! -group "$TARGET_GID" \) -print -quit)" ]; then
             continue
         fi
 
@@ -44,6 +46,19 @@ fi
 
 # Ensure HOME is set for non-root users without passwd entry
 export HOME="${HOME:-/home/browser}"
+
+case "${VNC_SHOW_CURSOR:-true}" in
+    true)
+        VNC_CURSOR_ARGS=(-nocursorshape)
+        ;;
+    false)
+        VNC_CURSOR_ARGS=(-nocursor)
+        ;;
+    *)
+        echo "VNC_SHOW_CURSOR must be true or false" >&2
+        exit 1
+        ;;
+esac
 
 PIDS=()
 
@@ -114,7 +129,8 @@ HTTP_LISTEN_HOST="${HTTP_LISTEN_HOST:-0.0.0.0}"
 HTTP_LISTEN_PORT="${HTTP_LISTEN_PORT:-8080}"
 
 # Start x11vnc
-x11vnc -display :99 -rfbport 5901 -nopw -forever -shared -listen "$VNC_LISTEN_HOST" &
+x11vnc -display :99 -rfbport 5901 -nopw -forever -shared \
+    -listen "$VNC_LISTEN_HOST" "${VNC_CURSOR_ARGS[@]}" &
 PIDS+=($!)
 sleep 0.3
 

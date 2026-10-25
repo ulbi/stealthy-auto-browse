@@ -1,0 +1,29 @@
+name: Challenge Detection Fixture
+steps:
+  - action: goto
+    url: ${env.TEST_URL}
+    wait_until: domcontentloaded
+  - action: eval
+    expression: window.addDocumentedChallengeFixtures()
+  - action: eval
+    expression: document.querySelector('#documented-challenge-fixtures').style.marginTop='4000px'
+  - action: detect_challenge
+    scroll_into_view: true
+    output_id: challenge
+  - action: eval
+    expression: (() => { const rect = document.querySelector('#documented-challenge-fixtures').getBoundingClientRect(); return rect.top >= 0 && rect.bottom <= innerHeight })()
+    output_id: challenge_in_viewport
+  - if:
+      condition:
+        type: output
+        output_id: challenge
+        path: [detected]
+        equals: true
+      then:
+        - action: eval
+          expression: "'human-review-needed'"
+          output_id: decision
+      else:
+        - action: eval
+          expression: "'continue'"
+          output_id: decision

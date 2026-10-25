@@ -1,6 +1,6 @@
-# Script Mode (Run & Exit)
+# Script mode (run & exit)
 
-Run a YAML script at container startup — execute the steps, get results as JSON on stdout, and the container exits. No HTTP server, no long-running process. Good for CI, cron jobs, one-shot scraping, or anything where you want to automate a sequence and get the output.
+Run a YAML script at container startup. The container executes the steps, prints the results as JSON on stdout, and exits. No HTTP server, no long-running process. Good for CI, cron jobs, one-shot scraping, or anything where you want to automate a sequence and get the output.
 
 ## Usage
 
@@ -15,7 +15,7 @@ cat my-script.yaml | docker run --rm -i \
   psyb0t/stealthy-auto-browse --script
 ```
 
-## Script Format
+## Script format
 
 ```yaml
 name: Scrape Example
@@ -64,16 +64,16 @@ The JSON printed to stdout looks like this:
 - **Logs go to stderr**, so `> results.json` gives you clean JSON.
 - **Exit code** is 0 if all steps succeed, 1 if any fail.
 
-## Key Features
+## Key features
 
 - **`output_id`** on any step collects its result into the `outputs` dict. This is how you get data out.
 - **`${env.VAR_NAME}`** in any string value is replaced with the environment variable. Pass `-e VAR=value` to Docker.
 - **`save_screenshot`** captures the browser viewport (or full desktop with `type: desktop`). Supports `width`, `height`, `whLargest` for resize. Can also write to disk with `path: /output/file.png` (in addition to `output_id`).
 - **`on_error: continue`** keeps going past failures. **`on_error: stop`** (default) halts on the first error.
-- **All HTTP API actions work as script steps** — goto, click, fill, eval, wait_for_element, etc.
+- **All HTTP API actions work as script steps**: goto, click, fill, eval, wait_for_element, etc.
 - **Page loaders still fire** on `goto` if configured.
 
-## Control Flow
+## Control flow
 
 Alongside ordinary `action` steps, scripts can use one control node per step: `if`, `repeat`, or `while`. Control nodes are intentionally explicit and bounded; they cannot carry sibling action fields.
 
@@ -125,14 +125,37 @@ Conditions are mappings with a `type`. `timeout` is optional (0 by default), pol
 | `element` | `selector`; optional `state` | CSS selector reaches `visible` (default), `hidden`, `attached`, or `detached`. |
 | `text` | `text` | The page body's visible text contains the string. |
 | `url` | `matches` | The current URL matches the glob pattern, e.g. `*dashboard*`. |
-| `javascript` | `expression` | The expression evaluates to the boolean `true`. Non-boolean results fail the control step. |
+| `javascript` | `expression` | The expression evaluates to the boolean `true` in the page's own JavaScript world, like `eval`. Non-boolean results fail the control step. |
 | `output` | `output_id` and exactly one of `equals` or `exists` | A prior `output_id` exists or its optional list `path` equals the supplied JSON value. |
 | `all` / `any` | `conditions` | Every / any nested condition matches. |
 | `not` | `condition` | Its nested condition does not match. |
 
 Environment placeholders are substituted recursively, including strings in control blocks: `text: "${env.EXPECTED_TEXT}"`. Conditions use the existing page-evaluation capability; only use scripts on targets you are authorized to automate.
 
-## Example: Screenshot a URL
+### Example: detect a challenge and pause for human review
+
+`detect_challenge` is a read-only page-inspection action. It can tell a workflow that a documented verification widget or a conservative generic challenge cue is present, but it never clicks, solves, or enters a challenge frame. Set `scroll_into_view: true` to bring the first visible detected frame or widget into the viewport for a human takeover; that still never clicks or focuses it. Use an `output` condition to hand the decision to your orchestration layer.
+
+```yaml
+steps:
+  - action: detect_challenge
+    scroll_into_view: true
+    output_id: challenge
+  - if:
+      condition:
+        type: output
+        output_id: challenge
+        path: [detected]
+        equals: true
+      then:
+        - action: eval
+          expression: "'notify-human'"
+          output_id: disposition
+```
+
+`challenge.status` is `absent`, `present`, or `unknown`. When `scroll_into_view` is enabled, `challenge.scrolled_into_view` reports whether a detected target is in the viewport after the action. Treat `unknown` as an operational decision point rather than proof that a challenge is absent. See [api.md#challenge-detection](api.md#challenge-detection) for the bounded result schema and supported signatures.
+
+## Example: screenshot a URL
 
 ```yaml
 name: Quick Screenshot
@@ -153,7 +176,7 @@ cat screenshot.yaml | docker run --rm -i -e URL=https://example.com \
 
 See `scripts/example_script.yaml` in the repo for a full example.
 
-## Example: Record a Flow
+## Example: record a flow
 
 Mount `/recordings` and pair `start_recording` with `stop_recording`. Multiple pairs in a single script land multiple MP4 files; collect them from the host after the container exits.
 

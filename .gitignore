@@ -14,6 +14,7 @@ ANUSTIMES.md
 research_files
 reply.txt
 git-update.sh
+git-update.sh.debot
 .claude
 lasttest.log
 tests/results/
@@ -27,3 +28,41 @@ plan.md
 .plan-and-delegate/
 mcp-server-ts/node_modules/
 mcp-server-ts/dist/
+sec.sarif
+
+# Codex and agent scratch
+CODEX.local.md
+.agent_notes/
+.agent_knowledge/
+PLAN.md
+implplan.md
+NOTES.md
+TODO.md
+WIP.md
+
+# Secrets
+.env
+.env.local
+.env.*
+!.env.example
+
+# Test and profile artifacts
+coverage.txt
+coverage.out
+profile.out
+.cover/
+htmlcov/
+
+# Editor and local runtime files
+.vscode/
+.idea/
+.editorconfig
+.envrc
+.tool-versions
+.python-version
+.nvmrc
+pyrightconfig.json
+node_modules/
+.venv/
+target/
+vendor/
